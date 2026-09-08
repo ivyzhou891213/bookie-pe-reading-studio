@@ -465,6 +465,38 @@ async function ocrPageCount(bookId: string): Promise<number> {
   return keys.filter((key) => String(key).startsWith(`${bookId}:`)).length;
 }
 
+function cleanUploadedBookTitle(filename: string) {
+  const raw = filename
+    .replace(/\.pdf$/i, '')
+    .replace(/[_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Download sites often append hashes, source labels and author metadata. Keep
+  // the reader-facing title short without altering the original local filename.
+  const cutAt = raw.search(/\b(?:anna'?s|archive|isbn|wiley|springer|pdfdrive|[a-f0-9]{12,}|tim koller|marc goedhart|david wessels)\b/i);
+  const title = (cutAt > 8 ? raw.slice(0, cutAt) : raw)
+    .replace(/[,:;\-–—\s]+$/g, '')
+    .replace(/\b\d+(?:st|nd|rd|th)\s*(?:ed(?:ition)?)?$/i, '')
+    .trim();
+  return title || '未命名书籍';
+}
+
+async function firstPageCover(pdf: { getPage: (page: number) => Promise<any> }) {
+  try {
+    const page = await pdf.getPage(1);
+    const viewport = page.getViewport({ scale: 0.28 });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(viewport.width));
+    canvas.height = Math.max(1, Math.round(viewport.height));
+    const context = canvas.getContext('2d');
+    if (!context) return '/book-placeholder.svg';
+    await page.render({ canvasContext: context, viewport }).promise;
+    return canvas.toDataURL('image/jpeg', 0.76);
+  } catch {
+    return '/book-placeholder.svg';
+  }
+}
+
 function loadStore(): Store {
   if (typeof window === 'undefined') return initialStore;
   try {
@@ -1262,6 +1294,7 @@ export default function Home() {
       const pdfjs = await import('pdfjs-dist');
       pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
       const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+      const cover = await firstPageCover(pdf);
       const samples: string[] = [];
       for (let pageNo = 1; pageNo <= Math.min(pdf.numPages, 24); pageNo += 1) {
         const page = await pdf.getPage(pageNo);
@@ -1281,10 +1314,10 @@ export default function Home() {
       const data: { book: Book } = {
         book: {
           id,
-          title: file.name.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ').trim() || '未命名书籍',
+          title: cleanUploadedBookTitle(file.name),
           short: 'MY',
           file: `local:${id}`,
-          cover: '/book-placeholder.svg',
+          cover,
           pages: pdf.numPages,
           color: '#8ca8bd',
           chapters: chapters.length ? chapters : [{ n: 1, title: ocrRequired ? '等待 OCR 识别目录' : '完整阅读', page: 1 }],
@@ -2395,10 +2428,11 @@ export default function Home() {
                       <img
                         src={b.cover}
                         alt={`${b.title} 封面`}
+                        onError={(event) => { event.currentTarget.src = '/book-placeholder.svg'; }}
                         className="h-20 w-14 shrink-0 rounded-lg object-cover shadow-sm"
                       />
                       <span className="min-w-0 flex-1">
-                        <b className="block truncate">{b.title}</b>
+                        <b className="block break-words line-clamp-2">{b.title}</b>
                         <span className="mt-1 block text-sm text-[var(--muted)]">
                           {language === 'zh' ? `当前第 ${store.progress[b.id] || 1} 页 · 共 ${b.pages} 页` : `Page ${store.progress[b.id] || 1} of ${b.pages}`}
                         </span>
