@@ -644,7 +644,15 @@ export default function Home() {
   const [localBookUrls, setLocalBookUrls] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    setStore(loadStore());
+    const loaded = loadStore();
+    setStore({
+      ...loaded,
+      uploadedBooks: loaded.uploadedBooks.map((item) =>
+        item.file.startsWith('local:')
+          ? { ...item, title: cleanUploadedBookTitle(item.title) }
+          : item,
+      ),
+    });
     setProvider(localStorage.getItem('pe-provider') || 'deepseek');
     setModel(localStorage.getItem('pe-model') || 'deepseek-v4-flash');
     setApiKey(localStorage.getItem('pe-api-key') || '');
@@ -667,8 +675,22 @@ export default function Home() {
     if (!book.file.startsWith('local:') || localBookUrls[book.id]) return;
     let active = true;
     loadLocalPdf(book.id)
-      .then((file) => {
-        if (file && active) setLocalBookUrls((urls) => ({ ...urls, [book.id]: URL.createObjectURL(file) }));
+      .then(async (file) => {
+        if (!file || !active) return;
+        setLocalBookUrls((urls) => ({ ...urls, [book.id]: URL.createObjectURL(file) }));
+        if (book.cover !== '/book-placeholder.svg') return;
+        const pdfjs = await import('pdfjs-dist');
+        pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+        const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+        const cover = await firstPageCover(pdf);
+        if (!active || cover === '/book-placeholder.svg') return;
+        setStore((current) => ({
+          ...current,
+          uploadedBooks: current.uploadedBooks.map((item) =>
+            item.id === book.id ? { ...item, cover } : item,
+          ),
+        }));
+        setBook((current) => current.id === book.id ? { ...current, cover } : current);
       })
       .catch(() => setUploadError('这本本地书籍文件暂时无法读取，请重新上传。'));
     return () => { active = false; };
