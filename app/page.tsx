@@ -512,6 +512,9 @@ export default function Home() {
   const [view, setView] = useState('home');
   const [store, setStore] = useState<Store>(initialStore);
   const [ready, setReady] = useState(false);
+  // A hosted demo must never ship the personal PDFs used during local development.
+  // Visitors begin with their own, lawfully obtained PDF files instead.
+  const [hostedMode, setHostedMode] = useState(false);
   const [book, setBook] = useState(BOOKS[0]);
   const [readerPlanId, setReaderPlanId] = useState<string | null>(null);
   const [page, setPage] = useState(53);
@@ -625,6 +628,7 @@ export default function Home() {
       Number(localStorage.getItem('pe-selected-chapter') || 1),
     );
     setLanguage((localStorage.getItem('pe-language') as 'zh' | 'en') || 'zh');
+    setHostedMode(!['localhost', '127.0.0.1'].includes(window.location.hostname));
     setReady(true);
   }, []);
   useEffect(() => {
@@ -662,10 +666,10 @@ export default function Home() {
 
   const books = useMemo(
     () =>
-      [...BOOKS, ...store.uploadedBooks].filter(
+      [...(hostedMode ? [] : BOOKS), ...store.uploadedBooks].filter(
         (b) => !store.archivedBooks[b.id],
       ),
-    [store.uploadedBooks, store.archivedBooks],
+    [hostedMode, store.uploadedBooks, store.archivedBooks],
   );
   const activePlan =
     store.studyPlans.find((plan) => plan.id === store.activePlanId) ||
@@ -2352,6 +2356,13 @@ export default function Home() {
               <p className="-mt-2 mb-4 text-xs text-[var(--muted)]">
                 {language === 'zh' ? `${books.length} 本 · 扫描件或低清晰度 PDF 上传后会标记为“需要整书 OCR”；完成后会保留在本机，阅读时无需逐页重复识别。建议 200–300 dpi。移除书籍不会删除你已保存的笔记、收藏或知识卡。` : `${books.length} books · Scanned or low-resolution PDFs are marked “Full-book OCR needed”. Once complete, results stay on this computer and are reused while reading. 200–300 dpi is recommended.`}
               </p>
+              {hostedMode && (
+                <p className="-mt-1 mb-4 rounded-xl border border-[var(--line)] bg-[#f8faf8] px-3 py-2 text-xs leading-5 text-[var(--muted)]">
+                  {language === 'zh'
+                    ? '公开测试版不附带预装书籍。请只上传你拥有合法使用权的 PDF；文件与 OCR 结果仅保存在当前浏览器。'
+                    : 'The public beta includes no preloaded books. Upload only PDFs you have the right to use; files and OCR results stay in this browser.'}
+                </p>
+              )}
               {ocrIndexingBookId && ocrProgress && (() => {
                 const target = books.find((item) => item.id === ocrIndexingBookId);
                 const percent = Math.round((ocrProgress.current / ocrProgress.total) * 100);
