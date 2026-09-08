@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="720" viewBox="0 0 480 720">
+  <rect width="480" height="720" fill="#1d1d1f"/>
+  <rect x="38" y="38" width="404" height="644" rx="18" fill="#f5f5f7"/>
+  <path d="M118 250c0-16 13-29 29-29h186c16 0 29 13 29 29v202c0 16-13 29-29 29H147c-16 0-29-13-29-29V250z" fill="#1d1d1f"/>
+  <path d="M240 221v260" stroke="#f5f5f7" stroke-width="8"/>
+  <text x="240" y="580" text-anchor="middle" fill="#1d1d1f" font-family="Arial, sans-serif" font-size="26" font-weight="700">MY LIBRARY</text>
+</svg>
