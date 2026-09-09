@@ -546,6 +546,18 @@ function dailyRowsForSchedule(schedule: PlannedWeek[], startDate: string, weekda
     });
   });
 }
+function fallbackDailyOutcome(day: PlannedDay, books: Book[]) {
+  const labels = day.tasks.flatMap((task) => {
+    const chapters = chaptersFor(task.bookId)
+      .filter((chapter) => chapter.n >= task.start && chapter.n <= task.end)
+      .map((chapter) => `Ch.${chapter.n} ${chapter.title}`);
+    const book = books.find((item) => item.id === task.bookId);
+    return chapters.length ? chapters : [`${scheduleBookLabel(book)} · Ch.${task.start}${task.end > task.start ? `–${task.end}` : ''}`];
+  });
+  return labels.length > 1
+    ? `串联 ${labels.slice(0, 2).join('；')}`.slice(0, 52)
+    : `掌握 ${labels[0] || '当天章节'} 的核心逻辑`.slice(0, 52);
+}
 const initialStore: Store = {
   questions: [],
   knowledge: [],
@@ -1224,6 +1236,20 @@ export default function Home() {
     if (normalized.some((row) => row === null) || seen.size !== expected.size) return null;
     return normalized as PlannedDay[];
   }
+  function validateAiDailyGuidance(candidate: unknown, baseline: PlannedDay[]) {
+    if (!Array.isArray(candidate)) return null;
+    const guidance = baseline.map((day) => {
+      const row = candidate.find((item) => {
+        const value = item as { week?: unknown; day?: unknown };
+        return Number(value.week) === day.week && Number(value.day) === day.day;
+      }) as { outcome?: unknown } | undefined;
+      const outcome = typeof row?.outcome === 'string' ? row.outcome.replace(/\s+/g, ' ').trim().slice(0, 52) : '';
+      return outcome.length >= 4 ? { week: day.week, day: day.day, outcome } : null;
+    });
+    return guidance.some((item) => item === null)
+      ? null
+      : guidance as NonNullable<StudyPlan['dailyGuidance']>;
+  }
   async function extractPlanChapterContexts(schedule: PlannedWeek[]) {
     const requested = [...new Map(schedule.flatMap((week) => week.units.flatMap((unit) => unit.chapterNos.map((chapterNo) => [`${unit.bookId}:${chapterNo}`, { bookId: unit.bookId, chapterNo }] as const)))).values()];
     const contexts: Array<{ book: string; chapter: string; text: string }> = [];
@@ -1309,8 +1335,8 @@ export default function Home() {
     let goal = planBrief;
     let schedule = buildSchedule(planBooks, weeks, weekdayTime, weekendTime);
     const baselineDays = dailyRowsForSchedule(schedule, planStartDate, weekdayTime, weekendTime);
-    let dailySchedule: PlannedDay[] | undefined;
-    let dailyGuidance: StudyPlan['dailyGuidance'] = [];
+    let dailySchedule: PlannedDay[] | undefined = baselineDays.map((day) => ({ ...day, outcome: fallbackDailyOutcome(day, books) }));
+    let dailyGuidance: StudyPlan['dailyGuidance'] = baselineDays.map((day) => ({ week: day.week, day: day.day, outcome: fallbackDailyOutcome(day, books) }));
     let aiPlanApplied = false;
     const ai = aiFor('planner');
     const key = ai.apiKey;
@@ -1367,19 +1393,21 @@ export default function Home() {
             weeklySummaries?: Array<{ week: number; focus?: string; outcome?: string }>;
             dailySummaries?: Array<{ week: number; day: number; focus?: string; outcome?: string }>;
             dailySchedule?: Array<{ week: number; day: number; tasks: Array<{ bookId: string; start: number; end: number }>; outcome?: string }>;
+            dailyGuidance?: Array<{ week: number; day: number; outcome?: string }>;
           };
+          usage?: ApiUsage;
           }};
         };
         let { response, data } = await requestPlan();
-        let acceptedDailySchedule = response.ok
-          ? validateAiDailySchedule(data.extracted?.dailySchedule, baselineDays, planBooks)
+        let acceptedDailyGuidance = response.ok
+          ? validateAiDailyGuidance(data.extracted?.dailyGuidance, baselineDays)
           : null;
         // Models occasionally return an otherwise good answer with one malformed
         // row. Repair it silently once, instead of asking the learner to retry.
-        if (!acceptedDailySchedule && response.ok) {
+        if (!acceptedDailyGuidance && response.ok) {
           ({ response, data } = await requestPlan(true));
-          acceptedDailySchedule = response.ok
-            ? validateAiDailySchedule(data.extracted?.dailySchedule, baselineDays, planBooks)
+          acceptedDailyGuidance = response.ok
+            ? validateAiDailyGuidance(data.extracted?.dailyGuidance, baselineDays)
             : null;
         }
         if (response.ok && data.extracted) {
@@ -1398,20 +1426,19 @@ export default function Home() {
               return ai ? { ...week, focus: ai.focus || week.focus, outcome: ai.outcome || week.outcome, aiOutcome: ai.outcome } : week;
             });
           }
-          if (acceptedDailySchedule) {
-            dailySchedule = acceptedDailySchedule;
-            dailyGuidance = acceptedDailySchedule.map((day) => ({ week: day.week, day: day.day, outcome: day.outcome }));
+          if (acceptedDailyGuidance) {
+            dailySchedule = baselineDays.map((day) => ({ ...day, outcome: acceptedDailyGuidance.find((item) => item.week === day.week && item.day === day.day)?.outcome }));
+            dailyGuidance = acceptedDailyGuidance;
             aiPlanApplied = true;
+            recordUsage(data.usage, planBrief, acceptedDailyGuidance.map((item) => item.outcome).join('\n'));
           } else {
-            dailySchedule = baselineDays;
-            setPlanError('AI 排程格式异常，系统已自动尝试修复；目前展示的是保证完整覆盖的保底安排。你仍可直接确认使用。');
+            setPlanError('AI 已被调用，但返回的每日重点格式不完整；系统已保留按时间分配的章节安排，并为每一天生成了基于章节标题的可读重点。可直接使用或再次生成。');
           }
         } else if (!response.ok) {
-          setPlanError((data as { error?: string }).error || 'AI 计划生成未完成，请检查 API Key 后重试。');
+          setPlanError((data as { error?: string }).error || 'AI 计划生成未完成；当前仍显示完整的本地安排和章节重点。请检查 API Key 后重试。');
         }
       } catch {
-        dailySchedule = baselineDays;
-        setPlanError('暂时无法连接 AI；目前展示的是保证完整覆盖的保底安排。你仍可直接确认使用。');
+        setPlanError('暂时无法连接 AI；当前仍显示完整的本地安排和章节重点。请检查网络或 API Key 后重试。');
       }
     }
     if (explicitDailyHours !== null && !anyClock) weekdayTime = `每天 ${explicitDailyHours} 小时`;
@@ -4134,10 +4161,12 @@ function DailyStudyCalendar({ plan, books, onOpenDay }: { plan: StudyPlan; books
             const mascot = mood === 'done' ? '/mascot-happy-v2.png' : mood === 'late' ? '/mascot-grumpy.png' : '/bookie-logo.png';
             const moodLabel = mood === 'done' ? 'Bookie 很开心：今日任务已完成' : mood === 'late' ? 'Bookie 有点不开心：今日任务尚未完成' : 'Bookie 正在为你加油';
             const content = <>
-              <div className="flex items-start justify-between gap-2">
-                <div><b className="text-xs">{day.label} ({day.date.slice(5).replace('-', '.')})</b><span className="mt-1 block text-[10px] text-[var(--muted)]">{mood === 'done' ? '已完成' : mood === 'late' ? '待补上' : '加油'}</span></div>
-                <img src={mascot} alt={moodLabel} title={moodLabel} className={`day-mascot ${mood === 'late' ? 'mascot-grumpy' : mood === 'cheer' ? 'mascot-cheer' : ''}`} />
-                <span className="text-[11px] text-[var(--muted)]">{day.time}</span>
+              <div>
+                <div className="flex items-start justify-between gap-2">
+                  <div><b className="text-xs">{day.label} ({day.date.slice(5).replace('-', '.')})</b><span className="mt-1 block text-[10px] text-[var(--muted)]">{mood === 'done' ? '已完成' : mood === 'late' ? '待补上' : '加油'}</span></div>
+                  <img src={mascot} alt={moodLabel} title={moodLabel} className={`day-mascot ${mood === 'late' ? 'mascot-grumpy' : mood === 'cheer' ? 'mascot-cheer' : ''}`} />
+                </div>
+                <span className="mt-2 block rounded-md bg-[var(--soft)] px-1.5 py-1 text-center text-[11px] font-medium leading-4 text-[var(--muted)]">{day.time}</span>
               </div>
               {day.tasks.length ? <>
                 <p className="mt-2 text-xs font-semibold leading-5 text-[var(--ink)]">
@@ -4309,8 +4338,13 @@ function PlannerModal({
                 继续对话即可修改
               </span>
             </div>
-            {error && <p className="mt-3 rounded-xl bg-[#fff5f4] px-3 py-2 text-sm font-medium text-[#b42318]">AI 章节重点未生成：{error}</p>}
-            <p className="mt-4 text-sm leading-6 text-[var(--muted)]">AI 会结合你的目标和时间给出每天的学习重点；章节范围按工作日与周末的可用时长分配。确认前可继续对话修改。</p>
+            {preview.aiPlanApplied ? (
+              <p className="mt-3 rounded-xl bg-[#f0f7ef] px-3 py-2 text-sm font-medium text-[#365c35]">DeepSeek 已生成并保存  {preview.dailyGuidance?.length || 0} 条每日学习重点；章节范围由系统完整校验。</p>
+            ) : (
+              <p className="mt-3 rounded-xl bg-[var(--gold-soft)] px-3 py-2 text-sm font-medium text-[var(--ink)]">当前为本地完整安排：时间与章节已生成，每日重点根据真实章节标题自动补全。</p>
+            )}
+            {error && <p className="mt-3 rounded-xl bg-[#fff5f4] px-3 py-2 text-sm font-medium text-[#b42318]">{error}</p>}
+            <p className="mt-4 text-sm leading-6 text-[var(--muted)]">章节范围按工作日与周末的可用时长分配；DeepSeek 仅生成并润色逐日学习重点，不会改动已校验的章节覆盖。</p>
             <DailyStudyCalendar plan={preview} books={books} />
             <button
               onClick={onSave}
