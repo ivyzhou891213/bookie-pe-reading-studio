@@ -3932,7 +3932,7 @@ function DailyStudyCalendar({ plan, books }: { plan: StudyPlan; books: Book[] })
                   }).join('；')}
                 </p>
                 {guidance?.outcome && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{guidance.outcome}</p>}
-                {!guidance?.outcome && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{plan.aiPlanApplied ? '阅读本章核心内容' : '等待 AI 生成本章重点'}</p>}
+                {!guidance?.outcome && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{plan.aiPlanApplied ? '阅读本章核心内容' : 'AI 重点未生成，请重新生成计划预览'}</p>}
               </> : <p className="mt-3 text-xs leading-5 text-[var(--muted)]">本周没有可分配章节</p>}
             </article>;
           })}
@@ -4093,6 +4093,7 @@ function PlannerModal({
                 继续对话即可修改
               </span>
             </div>
+            {error && <p className="mt-3 rounded-xl bg-[#fff5f4] px-3 py-2 text-sm font-medium text-[#b42318]">AI 章节重点未生成：{error}</p>}
             <p className="mt-4 text-sm leading-6 text-[var(--muted)]">AI 会结合你的目标和时间给出每天的学习重点；章节范围按工作日与周末的可用时长分配。确认前可继续对话修改。</p>
             <DailyStudyCalendar plan={preview} books={books} />
             <button
@@ -4101,11 +4102,6 @@ function PlannerModal({
             >
               确认并启用此计划
             </button>
-            {error && (
-              <p className="mt-3 text-sm font-medium text-[var(--muted)]">
-                {error}
-              </p>
-            )}
           </section>
         )}
       </section>
