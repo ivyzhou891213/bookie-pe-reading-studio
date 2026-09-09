@@ -2218,7 +2218,7 @@ export default function Home() {
             className={
               store.studyPlans.length
                 ? 'hidden'
-                : 'mb-7 grid gap-5 lg:grid-cols-[1.6fr_.8fr]'
+                : 'mb-7'
             }
           >
             <div className="rounded-[28px] bg-[var(--green)] p-7 text-white shadow-xl lg:p-9">
@@ -2242,11 +2242,11 @@ export default function Home() {
                 </span>
               </div>
               <p className="mb-3 text-sm text-white/65">选择今天要读的内容</p>
-              <div className="grid gap-3 md:grid-cols-[.9fr_1.4fr]">
+              <div className="grid gap-3 md:grid-cols-[minmax(0,.9fr)_minmax(0,1.4fr)]">
                 <select
                   value={selectedBookId}
                   onChange={(e) => chooseBook(e.target.value)}
-                  className="rounded-xl bg-white/12 px-3 py-3 outline-none"
+                  className="min-w-0 max-w-full rounded-xl bg-white/12 px-3 py-3 outline-none"
                 >
                   {books.map((b) => (
                     <option className="text-black" value={b.id} key={b.id}>
@@ -2257,7 +2257,7 @@ export default function Home() {
                 <select
                   value={selectedChapterNo}
                   onChange={(e) => chooseChapter(Number(e.target.value))}
-                  className="rounded-xl bg-white/12 px-3 py-3 outline-none"
+                  className="min-w-0 max-w-full rounded-xl bg-white/12 px-3 py-3 outline-none"
                 >
                   {chaptersFor(selectedBookId).map((c) => (
                     <option className="text-black" key={c.n} value={c.n}>
@@ -2314,34 +2314,6 @@ export default function Home() {
                   本周重点：{planFocus}
                 </span>
               </div>
-            </div>
-            <div className="rounded-[28px] border border-[var(--line)] bg-white p-7">
-              <div className="flex items-start justify-between">
-                <div>
-                  <p className="text-sm text-[var(--muted)]">当前学习计划</p>
-                  <p className="mt-1 text-4xl font-semibold">{planProgress}%</p>
-                </div>
-                <div className="grid size-12 place-items-center rounded-2xl bg-[var(--gold-soft)]">
-                  <Target className="text-[var(--brown)]" />
-                </div>
-              </div>
-              <div className="mt-8 h-2 overflow-hidden rounded-full bg-[var(--soft)]">
-                <div
-                  className="h-full rounded-full bg-[var(--green)]"
-                  style={{ width: `${planProgress}%` }}
-                />
-              </div>
-              <div className="mt-7 grid grid-cols-3 gap-3 text-center">
-                <Metric value={completedPlanChapters} label="完成章节" />
-                <Metric value={plannedChapterKeys.length} label="计划章节" />
-                <Metric value={activePlan?.weeks || 12} label="计划周数" />
-              </div>
-              <button
-                onClick={() => openPlanner()}
-                className="mt-6 w-full rounded-xl border border-[var(--line-strong)] py-2.5 text-sm font-semibold text-[var(--green)]"
-              >
-                制定学习计划
-              </button>
             </div>
           </section>
           <section className="hidden">
