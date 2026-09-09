@@ -104,6 +104,9 @@ type StudyPlan = {
   goal: string;
   createdAt: string;
   schedule?: PlannedWeek[];
+  // AI makes the day-by-day allocation. The weekly schedule remains the
+  // authoritative complete chapter list used for coverage and progress.
+  dailySchedule?: PlannedDay[];
   dailyGuidance?: Array<{ week: number; day: number; focus?: string; outcome?: string }>;
   aiPlanApplied?: boolean;
   adjustedWeeks?: Record<number, boolean>;
@@ -132,6 +135,7 @@ type PlannedDay = {
   label: string;
   time: string;
   tasks: { bookId: string; start: number; end: number; part?: string }[];
+  outcome?: string;
 };
 type ArchiveMeta = {
   folder: string;
@@ -448,7 +452,13 @@ function dailyRowsForSchedule(schedule: PlannedWeek[], startDate: string, weekda
       allocation.fill(1);
       let remaining = reading.length - 7;
       while (remaining > 0) {
-        const target = weights.indexOf(Math.max(...weights));
+        // Allocate the next chapter to the day with the lowest load relative
+        // to its available hours, so both weekend days receive more work.
+        const target = weights.reduce((best, weight, candidate) =>
+          allocation[candidate] / Math.max(0.25, weight) < allocation[best] / Math.max(0.25, weights[best])
+            ? candidate
+            : best,
+        0);
         allocation[target] += 1;
         remaining -= 1;
       }
@@ -1063,24 +1073,19 @@ export default function Home() {
     const weekendHours = hoursFromText(weekendTime, 2);
     const intensity =
       weekdayHours <= 1 ? '慢读' : weekdayHours < 2 ? '稳步' : '深读';
-    const totalChapters = bookIds.reduce((sum, id) => sum + chaptersFor(id).length, 0);
-    // Three focused hours per chapter is deliberately conservative: it includes
-    // reading, questions, and a short investor-style reflection.
-    const capacity = Math.max(1, Math.floor((weeks * (weekdayHours * 5 + weekendHours * 2)) / 3));
     return Array.from({ length: weeks }, (_, index) => {
       const units = bookIds.map((bookId) => {
         const chapters = chaptersFor(bookId);
-        const bookCapacity = Math.max(1, Math.round((capacity * chapters.length) / Math.max(1, totalChapters)));
-        const coveredChapters = chapters.slice(
-          0,
-          Math.min(chapters.length, bookCapacity),
-        );
-        const start = Math.floor((index * coveredChapters.length) / weeks);
+        // This is a complete-coverage baseline, not the final daily decision.
+        // The AI receives every chapter, every date and the hours available on
+        // that date, then may distribute these chapters between weekdays and
+        // weekends. It may never discard a chapter from this list.
+        const start = Math.floor((index * chapters.length) / weeks);
         const end = Math.max(
           start,
-          Math.ceil(((index + 1) * coveredChapters.length) / weeks) - 1,
+          Math.ceil(((index + 1) * chapters.length) / weeks) - 1,
         );
-        const chosen = coveredChapters.slice(start, end + 1);
+        const chosen = chapters.slice(start, end + 1);
         return {
           bookId,
           chapterNos: chosen.map((x) => x.n),
@@ -1105,6 +1110,42 @@ export default function Home() {
             : `围绕「${units.flatMap((u) => u.chapterNos.map((n) => chaptersFor(u.bookId).find((c) => c.n === n)?.title)).filter(Boolean).join('、')}」建立判断：它影响什么估值假设、交易决策或面试答案？`,
       };
     });
+  }
+  function validateAiDailySchedule(
+    candidate: unknown,
+    baseline: PlannedDay[],
+    bookIds: string[],
+  ): PlannedDay[] | null {
+    if (!Array.isArray(candidate) || candidate.length !== baseline.length) return null;
+    const expected = new Set(bookIds.flatMap((bookId) => chaptersFor(bookId).map((chapter) => `${bookId}:${chapter.n}`)));
+    const seen = new Set<string>();
+    const lastChapter = new Map<string, number>();
+    const normalized = baseline.map((base, index) => {
+      const row = candidate[index] as { week?: number; day?: number; tasks?: unknown; outcome?: unknown };
+      if (Number(row?.week) !== base.week || Number(row?.day) !== base.day || !Array.isArray(row?.tasks)) return null;
+      const tasks = row.tasks.flatMap((raw) => {
+        const task = raw as { bookId?: unknown; start?: unknown; end?: unknown };
+        const bookId = String(task.bookId || '');
+        const start = Number(task.start);
+        const end = Number(task.end ?? task.start);
+        if (!bookIds.includes(bookId) || !Number.isInteger(start) || !Number.isInteger(end) || end < start) return [];
+        return [{ bookId, start, end }];
+      });
+      if (tasks.length !== row.tasks.length) return null;
+      for (const task of tasks) {
+        for (let chapter = task.start; chapter <= task.end; chapter += 1) {
+          const key = `${task.bookId}:${chapter}`;
+          if (!expected.has(key) || seen.has(key)) return null;
+          const previous = lastChapter.get(task.bookId);
+          if (previous !== undefined && chapter !== previous + 1) return null;
+          seen.add(key);
+          lastChapter.set(task.bookId, chapter);
+        }
+      }
+      return { ...base, tasks, outcome: typeof row.outcome === 'string' ? row.outcome.slice(0, 52) : undefined };
+    });
+    if (normalized.some((row) => row === null) || seen.size !== expected.size) return null;
+    return normalized as PlannedDay[];
   }
   async function extractPlanChapterContexts(schedule: PlannedWeek[]) {
     const requested = [...new Map(schedule.flatMap((week) => week.units.flatMap((unit) => unit.chapterNos.map((chapterNo) => [`${unit.bookId}:${chapterNo}`, { bookId: unit.bookId, chapterNo }] as const)))).values()];
@@ -1181,6 +1222,8 @@ export default function Home() {
     let background = planBrief;
     let goal = planBrief;
     let schedule = buildSchedule(planBooks, weeks, weekdayTime, weekendTime);
+    const baselineDays = dailyRowsForSchedule(schedule, planStartDate, weekdayTime, weekendTime);
+    let dailySchedule: PlannedDay[] | undefined;
     let dailyGuidance: StudyPlan['dailyGuidance'] = [];
     let aiPlanApplied = false;
     const ai = aiFor('planner');
@@ -1198,9 +1241,15 @@ export default function Home() {
             thinking: ai.thinking,
             reasoningEffort: ai.reasoningEffort,
             brief: planBrief,
-            books: planBooks.map(
-              (id) => books.find((book) => book.id === id)?.title || id,
-            ),
+            books: planBooks.map((id) => ({
+              id,
+              title: books.find((book) => book.id === id)?.title || id,
+              chapters: chaptersFor(id).map((chapter, index, all) => ({
+                n: chapter.n,
+                title: chapter.title.slice(0, 80),
+                pages: Math.max(1, (all[index + 1]?.page || (books.find((book) => book.id === id)?.pages || chapter.page + 1) + 1) - chapter.page),
+              })),
+            })),
             draftSchedule: schedule.map((week) => ({
               week: week.week,
               reading: week.units.map((unit) => ({
@@ -1208,11 +1257,12 @@ export default function Home() {
                 chapters: unit.chapterNos.map((n) => `Ch.${n} ${chaptersFor(unit.bookId).find((c) => c.n === n)?.title}`),
               })),
             })),
-            draftDailySchedule: dailyRowsForSchedule(schedule, planStartDate, weekdayTime, weekendTime).map((day) => ({
+            draftDailySchedule: baselineDays.map((day) => ({
               week: day.week,
               day: day.day,
               date: day.date,
               time: day.time,
+              hours: scheduleHours(day.time, day.label === '周六' || day.label === '周日' ? hoursFromText(weekendTime, 2) : hoursFromText(weekdayTime, 2)),
               reading: day.tasks.map((task) => ({
                 book: books.find((book) => book.id === task.bookId)?.title,
                 chapters: task.start === task.end ? `Ch.${task.start}` : `Ch.${task.start}–Ch.${task.end}`,
@@ -1230,6 +1280,7 @@ export default function Home() {
             goal?: string;
             weeklySummaries?: Array<{ week: number; focus?: string; outcome?: string }>;
             dailySummaries?: Array<{ week: number; day: number; focus?: string; outcome?: string }>;
+            dailySchedule?: Array<{ week: number; day: number; tasks: Array<{ bookId: string; start: number; end: number }>; outcome?: string }>;
           };
         };
         if (response.ok && data.extracted) {
@@ -1247,9 +1298,14 @@ export default function Home() {
               return ai ? { ...week, focus: ai.focus || week.focus, outcome: ai.outcome || week.outcome, aiOutcome: ai.outcome } : week;
             });
           }
-          dailyGuidance = data.extracted.dailySummaries || [];
-          aiPlanApplied = dailyGuidance.length > 0;
-          if (!aiPlanApplied) setPlanError('AI 没有返回逐日重点；请重新生成，或检查设置中的 API Key。');
+          const acceptedDailySchedule = validateAiDailySchedule(data.extracted.dailySchedule, baselineDays, planBooks);
+          if (acceptedDailySchedule) {
+            dailySchedule = acceptedDailySchedule;
+            dailyGuidance = acceptedDailySchedule.map((day) => ({ week: day.week, day: day.day, outcome: day.outcome }));
+            aiPlanApplied = true;
+          } else {
+            setPlanError('AI 返回的排程遗漏、重复或跳过了章节；为保证四周完成整本书，系统没有采用这份排程。请重新生成。');
+          }
         } else if (!response.ok) {
           setPlanError((data as { error?: string }).error || 'AI 计划生成未完成，请检查 API Key 后重试。');
         }
@@ -1274,6 +1330,7 @@ export default function Home() {
         ? schedule
         : buildSchedule(planBooks, weeks, weekdayTime, weekendTime),
       dailyGuidance,
+      dailySchedule,
       aiPlanApplied,
       adjustedWeeks: {},
       conversation: [
@@ -3914,7 +3971,9 @@ function WeekCard({
 }
 function DailyStudyCalendar({ plan, books, onOpenDay }: { plan: StudyPlan; books: Book[]; onOpenDay?: (day: PlannedDay) => void }) {
   const schedule = plan.schedule || [];
-  const days = dailyRowsForSchedule(schedule, plan.startDate, plan.weekdayTime, plan.weekendTime);
+  const days = plan.dailySchedule?.length
+    ? plan.dailySchedule
+    : dailyRowsForSchedule(schedule, plan.startDate, plan.weekdayTime, plan.weekendTime);
   if (!days.length) return null;
   return <div className="mt-5 space-y-5">
     {schedule.map((week) => {
@@ -3945,7 +4004,7 @@ function DailyStudyCalendar({ plan, books, onOpenDay }: { plan: StudyPlan; books
                     return `${scheduleBookLabel(book)} · Ch.${task.start}${task.end !== task.start ? `–Ch.${task.end}` : ''}${task.part ? `（第 ${task.part} 段）` : ''}`;
                   }).join('；')}
                 </p>
-                {guidance?.outcome && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{guidance.outcome}</p>}
+                {(day.outcome || guidance?.outcome) && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{day.outcome || guidance?.outcome}</p>}
                 {!guidance?.outcome && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{plan.aiPlanApplied ? '阅读本章核心内容' : 'AI 重点未生成，请重新生成计划预览'}</p>}
               </> : <p className="mt-3 text-xs leading-5 text-[var(--muted)]">本周没有可分配章节</p>}
             </>;
