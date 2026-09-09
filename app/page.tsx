@@ -695,6 +695,40 @@ export default function Home() {
       .catch(() => setUploadError('这本本地书籍文件暂时无法读取，请重新上传。'));
     return () => { active = false; };
   }, [book, localBookUrls]);
+  // Older uploads predate automatic cover generation. Refresh their shelf cards
+  // in the background instead of requiring the reader to open every book.
+  useEffect(() => {
+    if (!ready) return;
+    const missingCovers = store.uploadedBooks.filter(
+      (item) => item.file.startsWith('local:') && item.cover === '/book-placeholder.svg',
+    );
+    if (!missingCovers.length) return;
+    let active = true;
+    Promise.all(
+      missingCovers.map(async (item) => {
+        try {
+          const file = await loadLocalPdf(item.id);
+          if (!file) return { id: item.id, cover: '' };
+          const pdfjs = await import('pdfjs-dist');
+          pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+          const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+          return { id: item.id, cover: await firstPageCover(pdf) };
+        } catch {
+          return { id: item.id, cover: '' };
+        }
+      }),
+    ).then((covers) => {
+      if (!active || !covers.some((item) => item.cover && item.cover !== '/book-placeholder.svg')) return;
+      setStore((current) => ({
+        ...current,
+        uploadedBooks: current.uploadedBooks.map((item) => {
+          const replacement = covers.find((cover) => cover.id === item.id)?.cover;
+          return replacement && replacement !== '/book-placeholder.svg' ? { ...item, cover: replacement } : item;
+        }),
+      }));
+    });
+    return () => { active = false; };
+  }, [ready, store.uploadedBooks]);
   useEffect(() => {
     if (ready)
       localStorage.setItem('pe-classroom-store', JSON.stringify(store));
