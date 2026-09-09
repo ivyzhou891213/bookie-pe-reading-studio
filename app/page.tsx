@@ -2461,7 +2461,15 @@ export default function Home() {
                 <button onClick={() => { setShowPlanManager(false); setManagedPlanId(null); }} className="rounded-xl border border-[var(--line)] px-3 py-2 text-sm">{language === 'zh' ? '收起' : 'Collapse'}</button>
               </div>
               <p className="mt-4 text-sm leading-6 text-[var(--muted)]">每天的章节量已按工作日与周末可用时长分开分配；周末会获得更完整的阅读单元。</p>
-              <DailyStudyCalendar plan={{ ...activePlan, schedule: planStats(activePlan).schedule }} books={books} />
+              <DailyStudyCalendar
+                plan={{ ...activePlan, schedule: planStats(activePlan).schedule }}
+                books={books}
+                onOpenDay={(day) => {
+                  const task = day.tasks[0];
+                  if (!task) return;
+                  openPlanUnit(activePlan, day.week, { bookId: task.bookId, chapterNos: [task.start], summary: '' });
+                }}
+              />
               <div className="mt-5 flex flex-wrap gap-2">
                 <button onClick={() => openPlanner(activePlan)} className="rounded-xl bg-[var(--ink)] px-3 py-2 text-sm font-semibold text-white">{language === 'zh' ? '继续规划对话' : 'Refine with AI'}</button>
                 <button onClick={() => openPlanReader(activePlan)} className="rounded-xl border border-[var(--line)] px-3 py-2 text-sm font-semibold">{language === 'zh' ? '继续阅读' : 'Continue reading'}</button>
@@ -3904,7 +3912,7 @@ function WeekCard({
     </article>
   );
 }
-function DailyStudyCalendar({ plan, books }: { plan: StudyPlan; books: Book[] }) {
+function DailyStudyCalendar({ plan, books, onOpenDay }: { plan: StudyPlan; books: Book[]; onOpenDay?: (day: PlannedDay) => void }) {
   const schedule = plan.schedule || [];
   const days = dailyRowsForSchedule(schedule, plan.startDate, plan.weekdayTime, plan.weekendTime);
   if (!days.length) return null;
@@ -3919,9 +3927,15 @@ function DailyStudyCalendar({ plan, books }: { plan: StudyPlan; books: Book[] })
         <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-7">
           {weekDays.map((day) => {
             const guidance = plan.dailyGuidance?.find((item) => item.week === day.week && item.day === day.day);
-            return <article key={day.date} className={`min-h-28 rounded-xl p-3 ${day.tasks.length ? 'bg-white shadow-sm' : 'bg-[var(--soft)]/70'}`}>
+            const completed = day.tasks.length > 0 && day.tasks.every((task) => Array.from({ length: task.end - task.start + 1 }, (_, index) => (plan.completedChapters || {})[`${task.bookId}:${task.start + index}`]).every(Boolean));
+            const isLate = !completed && day.date < localDateKey(new Date());
+            const mood = completed ? 'done' : isLate ? 'late' : 'cheer';
+            const mascot = mood === 'done' ? '/mascot-happy-v2.png' : mood === 'late' ? '/mascot-grumpy.png' : '/bookie-logo.png';
+            const moodLabel = mood === 'done' ? 'Bookie 很开心：今日任务已完成' : mood === 'late' ? 'Bookie 有点不开心：今日任务尚未完成' : 'Bookie 正在为你加油';
+            const content = <>
               <div className="flex items-start justify-between gap-2">
-                <b className="text-xs">{day.label} ({day.date.slice(5).replace('-', '.')})</b>
+                <div><b className="text-xs">{day.label} ({day.date.slice(5).replace('-', '.')})</b><span className="mt-1 block text-[10px] text-[var(--muted)]">{mood === 'done' ? '已完成' : mood === 'late' ? '待补上' : '加油'}</span></div>
+                <img src={mascot} alt={moodLabel} title={moodLabel} className={`day-mascot ${mood === 'late' ? 'mascot-grumpy' : mood === 'cheer' ? 'mascot-cheer' : ''}`} />
                 <span className="text-[11px] text-[var(--muted)]">{day.time}</span>
               </div>
               {day.tasks.length ? <>
@@ -3934,7 +3948,8 @@ function DailyStudyCalendar({ plan, books }: { plan: StudyPlan; books: Book[] })
                 {guidance?.outcome && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{guidance.outcome}</p>}
                 {!guidance?.outcome && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{plan.aiPlanApplied ? '阅读本章核心内容' : 'AI 重点未生成，请重新生成计划预览'}</p>}
               </> : <p className="mt-3 text-xs leading-5 text-[var(--muted)]">本周没有可分配章节</p>}
-            </article>;
+            </>;
+            return onOpenDay && day.tasks.length ? <button key={day.date} onClick={() => onOpenDay(day)} className="min-h-28 rounded-xl bg-white p-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:ring-2 hover:ring-[var(--green)]/30" title="打开当天安排的章节">{content}</button> : <article key={day.date} className={`min-h-28 rounded-xl p-3 ${day.tasks.length ? 'bg-white shadow-sm' : 'bg-[var(--soft)]/70'}`}>{content}</article>;
           })}
         </div>
       </section>;
