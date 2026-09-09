@@ -105,6 +105,7 @@ type StudyPlan = {
   createdAt: string;
   schedule?: PlannedWeek[];
   dailyGuidance?: Array<{ week: number; day: number; focus?: string; outcome?: string }>;
+  aiPlanApplied?: boolean;
   adjustedWeeks?: Record<number, boolean>;
   conversation?: { text: string; createdAt: string }[];
   collapsed?: boolean;
@@ -1105,6 +1106,43 @@ export default function Home() {
       };
     });
   }
+  async function extractPlanChapterContexts(schedule: PlannedWeek[]) {
+    const requested = [...new Map(schedule.flatMap((week) => week.units.flatMap((unit) => unit.chapterNos.map((chapterNo) => [`${unit.bookId}:${chapterNo}`, { bookId: unit.bookId, chapterNo }] as const)))).values()];
+    const contexts: Array<{ book: string; chapter: string; text: string }> = [];
+    const pdfCache = new Map<string, { target: Book; pdf: any }>();
+    for (const reference of requested.slice(0, 36)) {
+      try {
+        let cached = pdfCache.get(reference.bookId);
+        if (!cached) {
+          const target = books.find((item) => item.id === reference.bookId);
+          if (!target?.file.startsWith('local:')) continue;
+          const file = await loadLocalPdf(target.id);
+          if (!file) continue;
+          const pdfjs = await import('pdfjs-dist');
+          pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+          cached = { target, pdf: await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise };
+          pdfCache.set(reference.bookId, cached);
+        }
+        const { target, pdf } = cached;
+        const chapters = chaptersFor(target.id);
+        const index = chapters.findIndex((chapter) => chapter.n === reference.chapterNo);
+        const startPage = Math.max(1, chapters[index]?.page || 1);
+        const endPage = Math.min(pdf.numPages, (chapters[index + 1]?.page || startPage + 2) - 1, startPage + 1);
+        const pages: string[] = [];
+        for (let pageNo = startPage; pageNo <= endPage; pageNo += 1) {
+          const page = await pdf.getPage(pageNo);
+          const content = await page.getTextContent();
+          const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim() || await loadOcrPage(target.id, pageNo);
+          if (text) pages.push(text);
+        }
+        const text = pages.join(' ').slice(0, 700);
+        if (text) contexts.push({ book: scheduleBookLabel(target), chapter: `Ch.${reference.chapterNo}`, text });
+      } catch {
+        // A missing local PDF must not stop deterministic planning.
+      }
+    }
+    return contexts;
+  }
   async function extractPlanFromBrief() {
     const incompleteBook = planBooks.map((id) => books.find((book) => book.id === id)).find((book) => book?.file.startsWith('local:') && chaptersFor(book.id).length < 4);
     if (incompleteBook) {
@@ -1144,10 +1182,12 @@ export default function Home() {
     let goal = planBrief;
     let schedule = buildSchedule(planBooks, weeks, weekdayTime, weekendTime);
     let dailyGuidance: StudyPlan['dailyGuidance'] = [];
+    let aiPlanApplied = false;
     const ai = aiFor('planner');
     const key = ai.apiKey;
     if (key) {
       try {
+        const chapterContexts = await extractPlanChapterContexts(schedule);
         const response = await fetch('/api/planner', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1178,6 +1218,7 @@ export default function Home() {
                 chapters: task.start === task.end ? `Ch.${task.start}` : `Ch.${task.start}–Ch.${task.end}`,
               })),
             })),
+            chapterContexts,
           }),
         });
         const data = (await response.json()) as {
@@ -1207,9 +1248,13 @@ export default function Home() {
             });
           }
           dailyGuidance = data.extracted.dailySummaries || [];
+          aiPlanApplied = dailyGuidance.length > 0;
+          if (!aiPlanApplied) setPlanError('AI 没有返回逐日重点；请重新生成，或检查设置中的 API Key。');
+        } else if (!response.ok) {
+          setPlanError((data as { error?: string }).error || 'AI 计划生成未完成，请检查 API Key 后重试。');
         }
       } catch {
-        /* Local parsing remains available without a model connection. */
+        setPlanError('无法读取章节内容或连接 AI；已生成基础章节安排，但未生成 AI 学习重点。');
       }
     }
     if (explicitDailyHours !== null && !anyClock) weekdayTime = `每天 ${explicitDailyHours} 小时`;
@@ -1229,6 +1274,7 @@ export default function Home() {
         ? schedule
         : buildSchedule(planBooks, weeks, weekdayTime, weekendTime),
       dailyGuidance,
+      aiPlanApplied,
       adjustedWeeks: {},
       conversation: [
         ...(planPreview?.conversation || []),
@@ -3867,7 +3913,7 @@ function DailyStudyCalendar({ plan, books }: { plan: StudyPlan; books: Book[] })
       const weekDays = days.filter((day) => day.week === week.week);
       return <section key={week.week} className="rounded-2xl border border-[var(--line)] bg-[#fbfcfb] p-3 sm:p-4">
         <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-          <b className="text-sm">第 {week.week} 周 · {week.focus}</b>
+          <b className="text-sm">第 {week.week} 周 · 每日阅读安排</b>
           <span className="text-xs text-[var(--muted)]">{weekDays[0]?.date.replaceAll('-', '.')} – {weekDays.at(-1)?.date.replaceAll('-', '.')}</span>
         </div>
         <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-7">
@@ -3885,7 +3931,8 @@ function DailyStudyCalendar({ plan, books }: { plan: StudyPlan; books: Book[] })
                     return `${scheduleBookLabel(book)} · Ch.${task.start}${task.end !== task.start ? `–Ch.${task.end}` : ''}${task.part ? `（第 ${task.part} 段）` : ''}`;
                   }).join('；')}
                 </p>
-                <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{guidance?.focus || week.focus}{guidance?.outcome ? `：${guidance.outcome}` : ''}</p>
+                {guidance?.outcome && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{guidance.outcome}</p>}
+                {!guidance?.outcome && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{plan.aiPlanApplied ? '阅读本章核心内容' : '等待 AI 生成本章重点'}</p>}
               </> : <p className="mt-3 text-xs leading-5 text-[var(--muted)]">本周没有可分配章节</p>}
             </article>;
           })}
