@@ -104,6 +104,7 @@ type StudyPlan = {
   goal: string;
   createdAt: string;
   schedule?: PlannedWeek[];
+  dailyGuidance?: Array<{ week: number; day: number; focus?: string; outcome?: string }>;
   adjustedWeeks?: Record<number, boolean>;
   conversation?: { text: string; createdAt: string }[];
   collapsed?: boolean;
@@ -122,6 +123,14 @@ type PlannedWeek = {
   units: { bookId: string; chapterNos: number[]; summary: string }[];
   outcome: string;
   aiOutcome?: string;
+};
+type PlannedDay = {
+  week: number;
+  day: number;
+  date: string;
+  label: string;
+  time: string;
+  tasks: { bookId: string; start: number; end: number }[];
 };
 type ArchiveMeta = {
   folder: string;
@@ -386,6 +395,68 @@ function formatOcrDuration(seconds: number) {
   if (rounded < 60) return `约 ${rounded} 秒`;
   const minutes = Math.ceil(rounded / 60);
   return minutes < 60 ? `约 ${minutes} 分钟` : `约 ${Math.ceil(minutes / 60)} 小时`;
+}
+function scheduleHours(value: string, fallback: number) {
+  const numeric = value.match(/(\d+(?:\.\d+)?)\s*(?:小时|h\b)/i);
+  if (numeric) return Number(numeric[1]);
+  if (/半个?小时/.test(value)) return 0.5;
+  const clock = value.match(/(\d{1,2})\s*(?::\d{2}|点)?\s*(?:到|[-–—])\s*(\d{1,2})/);
+  if (clock) {
+    const hours = Number(clock[2]) - Number(clock[1]);
+    if (hours > 0 && hours <= 12) return hours;
+  }
+  return fallback;
+}
+function dailyRowsForSchedule(schedule: PlannedWeek[], startDate: string, weekdayTime: string, weekendTime: string): PlannedDay[] {
+  const weekdayHours = scheduleHours(weekdayTime, 2);
+  const weekendHours = scheduleHours(weekendTime, 2);
+  const weekdayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  return schedule.flatMap((week, weekIndex) => {
+    const reading = week.units.flatMap((unit) => unit.chapterNos.map((chapter) => ({ bookId: unit.bookId, chapter })));
+    const weekStart = new Date(`${startDate}T00:00:00`);
+    weekStart.setDate(weekStart.getDate() + weekIndex * 7);
+    const weights = Array.from({ length: 7 }, (_, day) => {
+      const calendarDay = (weekStart.getDay() + day) % 7;
+      return calendarDay === 0 || calendarDay === 6 ? weekendHours : weekdayHours;
+    });
+    const allocation = Array(7).fill(0) as number[];
+    if (reading.length >= 7) {
+      allocation.fill(1);
+      let remaining = reading.length - 7;
+      while (remaining > 0) {
+        const target = weights.indexOf(Math.max(...weights));
+        allocation[target] += 1;
+        remaining -= 1;
+      }
+    } else {
+      [...reading.keys()].forEach((index) => {
+        const day = [...weights.keys()].sort((a, b) => weights[b] - weights[a])[index];
+        allocation[day] += 1;
+      });
+    }
+    let cursor = 0;
+    return allocation.map((count, day) => {
+      const items = reading.slice(cursor, cursor + count);
+      cursor += count;
+      const tasks = items.reduce<PlannedDay['tasks']>((groups, item) => {
+        const last = groups.at(-1);
+        if (last && last.bookId === item.bookId && last.end + 1 === item.chapter) last.end = item.chapter;
+        else groups.push({ bookId: item.bookId, start: item.chapter, end: item.chapter });
+        return groups;
+      }, []);
+      const date = new Date(weekStart);
+      date.setDate(date.getDate() + day);
+      const calendarDay = date.getDay();
+      return {
+        week: week.week,
+        day: day + 1,
+        date: date.toISOString().slice(0, 10),
+        label: weekdayLabels[(calendarDay + 6) % 7],
+        time: calendarDay === 0 || calendarDay === 6 ? weekendTime : formatStudyTime(weekdayTime),
+        tasks,
+      };
+    });
+  });
 }
 const initialStore: Store = {
   questions: [],
@@ -1037,6 +1108,7 @@ export default function Home() {
     let background = planBrief;
     let goal = planBrief;
     let schedule = buildSchedule(planBooks, weeks, weekdayTime, weekendTime);
+    let dailyGuidance: StudyPlan['dailyGuidance'] = [];
     const ai = aiFor('planner');
     const key = ai.apiKey;
     if (key) {
@@ -1061,6 +1133,16 @@ export default function Home() {
                 chapters: unit.chapterNos.map((n) => `Ch.${n} ${chaptersFor(unit.bookId).find((c) => c.n === n)?.title}`),
               })),
             })),
+            draftDailySchedule: dailyRowsForSchedule(schedule, planStartDate, weekdayTime, weekendTime).map((day) => ({
+              week: day.week,
+              day: day.day,
+              date: day.date,
+              time: day.time,
+              reading: day.tasks.map((task) => ({
+                book: books.find((book) => book.id === task.bookId)?.title,
+                chapters: task.start === task.end ? `Ch.${task.start}` : `Ch.${task.start}–Ch.${task.end}`,
+              })),
+            })),
           }),
         });
         const data = (await response.json()) as {
@@ -1071,6 +1153,7 @@ export default function Home() {
             background?: string;
             goal?: string;
             weeklySummaries?: Array<{ week: number; focus?: string; outcome?: string }>;
+            dailySummaries?: Array<{ week: number; day: number; focus?: string; outcome?: string }>;
           };
         };
         if (response.ok && data.extracted) {
@@ -1088,6 +1171,7 @@ export default function Home() {
               return ai ? { ...week, focus: ai.focus || week.focus, outcome: ai.outcome || week.outcome, aiOutcome: ai.outcome } : week;
             });
           }
+          dailyGuidance = data.extracted.dailySummaries || [];
         }
       } catch {
         /* Local parsing remains available without a model connection. */
@@ -1113,6 +1197,7 @@ export default function Home() {
       schedule: schedule.length
         ? schedule
         : buildSchedule(planBooks, weeks, weekdayTime, weekendTime),
+      dailyGuidance,
       adjustedWeeks: {},
       conversation: [
         ...(planPreview?.conversation || []),
@@ -2295,22 +2380,8 @@ export default function Home() {
                 </div>
                 <button onClick={() => { setShowPlanManager(false); setManagedPlanId(null); }} className="rounded-xl border border-[var(--line)] px-3 py-2 text-sm">{language === 'zh' ? '收起' : 'Collapse'}</button>
               </div>
-              <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                {planStats(activePlan).schedule.map((week) => {
-                  const keys = week.units.flatMap((unit) => unit.chapterNos.map((chapter) => `${unit.bookId}:${chapter}`));
-                  const done = keys.length > 0 && keys.every((key) => (activePlan.completedChapters || store.completedChapters)[key]);
-                  const current = activePlan.readerState?.week || 1;
-                  const mood = done ? 'done' : week.week < current ? 'late' : week.week === current ? 'current' : 'future';
-                  const mascot = mood === 'late' ? '/mascot-grumpy.png' : mood === 'future' ? '/bookie-logo.png' : '/mascot-happy-v2.png';
-                  const moodAlt = mood === 'late' ? (language === 'zh' ? 'Bookie 有点不开心' : 'Bookie is disappointed') : mood === 'current' ? (language === 'zh' ? 'Bookie 正在为你加油' : 'Bookie is cheering you on') : mood === 'done' ? (language === 'zh' ? 'Bookie 很开心' : 'Bookie is celebrating') : (language === 'zh' ? 'Bookie 在等待' : 'Bookie is waiting');
-                  return <article key={week.week} className={`week-card rounded-2xl p-4 ${mood === 'current' ? 'is-current' : ''}`}>
-                    <button onClick={() => openPlanUnit(activePlan, week.week, week.units[0])} className="flex w-full items-start justify-between gap-3 text-left"><div><p className="text-xs font-semibold tracking-wide text-[var(--muted)]">WEEK {week.week}{mood === 'current' ? (language === 'zh' ? ' · 当前周' : ' · Current week') : ''}</p><p className="mt-1 text-xs font-medium text-[var(--green)]">{weekDates(activePlan, week.week)}</p><h3 className="mt-2 font-semibold">{week.focus}</h3></div><img className="mascot motion-none" src={mascot} alt={moodAlt} /></button>
-                    <div className="mt-3 space-y-2">{week.units.map((unit) => { const unitBook = books.find((item) => item.id === unit.bookId); return <button key={unit.bookId} onClick={() => openPlanUnit(activePlan, week.week, unit)} className="w-full rounded-xl bg-[var(--soft)] px-3 py-2 text-left text-sm leading-5 hover:bg-white"><b>{unitBook?.title}</b> · {unit.chapterNos.map((chapter) => `Ch.${chapter}`).join(' · ')} <span className="float-right text-[var(--green)]">›</span></button>; })}</div>
-                    <p className="mt-3 border-t border-dashed border-[var(--line)] pt-3 text-xs font-medium text-[var(--muted)]">{language === 'zh' ? `每日阅读：工作日 ${formatStudyTime(activePlan.weekdayTime)} · ${activePlan.weekendTime}` : `Reading time: weekdays ${formatStudyTime(activePlan.weekdayTime)} · ${activePlan.weekendTime}`}</p>
-                    <p className="mt-3 text-sm leading-6"><b>{language === 'zh' ? '本周形成：' : 'This week you will gain: '}</b>{week.outcome}</p>
-                  </article>;
-                })}
-              </div>
+              <p className="mt-4 text-sm leading-6 text-[var(--muted)]">每天的章节量已按工作日与周末可用时长分开分配；周末会获得更完整的阅读单元。</p>
+              <DailyStudyCalendar plan={{ ...activePlan, schedule: planStats(activePlan).schedule }} books={books} />
               <div className="mt-5 flex flex-wrap gap-2">
                 <button onClick={() => openPlanner(activePlan)} className="rounded-xl bg-[var(--ink)] px-3 py-2 text-sm font-semibold text-white">{language === 'zh' ? '继续规划对话' : 'Refine with AI'}</button>
                 <button onClick={() => openPlanReader(activePlan)} className="rounded-xl border border-[var(--line)] px-3 py-2 text-sm font-semibold">{language === 'zh' ? '继续阅读' : 'Continue reading'}</button>
@@ -3752,6 +3823,43 @@ function WeekCard({
     </article>
   );
 }
+function DailyStudyCalendar({ plan, books }: { plan: StudyPlan; books: Book[] }) {
+  const schedule = plan.schedule || [];
+  const days = dailyRowsForSchedule(schedule, plan.startDate, plan.weekdayTime, plan.weekendTime);
+  if (!days.length) return null;
+  return <div className="mt-5 space-y-5">
+    {schedule.map((week) => {
+      const weekDays = days.filter((day) => day.week === week.week);
+      return <section key={week.week} className="rounded-2xl border border-[var(--line)] bg-[#fbfcfb] p-3 sm:p-4">
+        <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+          <b className="text-sm">第 {week.week} 周 · {week.focus}</b>
+          <span className="text-xs text-[var(--muted)]">{weekDays[0]?.date.replaceAll('-', '.')} – {weekDays.at(-1)?.date.replaceAll('-', '.')}</span>
+        </div>
+        <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-7">
+          {weekDays.map((day) => {
+            const guidance = plan.dailyGuidance?.find((item) => item.week === day.week && item.day === day.day);
+            return <article key={day.date} className={`min-h-28 rounded-xl p-3 ${day.tasks.length ? 'bg-white shadow-sm' : 'bg-[var(--soft)]/70'}`}>
+              <div className="flex items-start justify-between gap-2">
+                <b className="text-xs">{day.label} ({day.date.slice(5).replace('-', '.')})</b>
+                <span className="text-[11px] text-[var(--muted)]">{day.time}</span>
+              </div>
+              {day.tasks.length ? <>
+                <p className="mt-2 text-xs font-semibold leading-5 text-[var(--ink)]">
+                  {day.tasks.map((task) => {
+                    const book = books.find((item) => item.id === task.bookId);
+                    return `${book?.short || book?.title || '书'} · Ch.${task.start}${task.end !== task.start ? `–Ch.${task.end}` : ''}`;
+                  }).join('；')}
+                </p>
+                <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{guidance?.focus || week.focus}{guidance?.outcome ? `：${guidance.outcome}` : ''}</p>
+              </> : <p className="mt-3 text-xs leading-5 text-[var(--muted)]">复盘、整理问题或休息</p>}
+            </article>;
+          })}
+        </div>
+      </section>;
+    })}
+  </div>;
+}
+
 function PlannerModal({
   books,
   selected,
@@ -3900,27 +4008,8 @@ function PlannerModal({
                 继续对话即可修改
               </span>
             </div>
-            <div className="mt-4 grid gap-2 sm:grid-cols-2">
-              {preview.schedule?.map((week) => (
-                <div
-                  key={week.week}
-                  className="rounded-2xl bg-white/70 p-3 text-sm"
-                >
-                  <b>
-                    第 {week.week} 周 · {formatStudyTime(preview.weekdayTime)}
-                  </b>
-                  <p className="mt-1 leading-5 text-[var(--muted)]">
-                    <span className="block">
-                      阅读：
-                      {week.units
-                        .map((unit) => unit.summary.replace(/ · /g, '、'))
-                        .join('；')}
-                    </span>
-                    <span className="mt-1 block">学会：{week.outcome}</span>
-                  </p>
-                </div>
-              ))}
-            </div>
+            <p className="mt-4 text-sm leading-6 text-[var(--muted)]">AI 会结合你的目标和时间给出每天的学习重点；章节范围按工作日与周末的可用时长分配。确认前可继续对话修改。</p>
+            <DailyStudyCalendar plan={preview} books={books} />
             <button
               onClick={onSave}
               className="mt-5 rounded-full bg-[var(--brown)] px-5 py-3 text-sm font-semibold text-white"

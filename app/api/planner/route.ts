@@ -7,6 +7,7 @@ type PlannerRequest = {
   brief: string;
   books: string[];
   draftSchedule?: Array<{ week: number; reading: Array<{ book?: string; chapters: string[] }> }>;
+  draftDailySchedule?: Array<{ week: number; day: number; date: string; time: string; reading: Array<{ book?: string; chapters: string }> }>;
 };
 
 export async function POST(request: Request) {
@@ -17,7 +18,7 @@ export async function POST(request: Request) {
         { error: '缺少学习描述或 API Key。' },
         { status: 400 },
       );
-    const prompt = `你是严谨的私人股权学习规划师。阅读用户描述，提取学习规划参数，并为每周写不同、具体、专业的学习成果。用户选择的书：${body.books.join('、')}。下面的阅读章节分配已经由系统按时间容量计算；不要更改章节，只为每周生成不同的 focus（不超过16字）和 outcome（不超过60字，必须点出本周的估值/交易/投资判断应用）。只返回合法 JSON，不要 markdown：{"weeks":12,"weekdayTime":"...","weekendTime":"...","background":"...","goal":"...","weeklySummaries":[{"week":1,"focus":"...","outcome":"..."}]}。weeks 必须是 2-52 的整数；对用户明确给出的周期和时间必须原样尊重。\n\n用户描述：${body.brief}\n\n已排定章节：${JSON.stringify(body.draftSchedule || [])}`;
+    const prompt = `你是严谨、克制的私人股权学习规划师。阅读用户描述，提取学习规划参数，并审阅系统依据工作日/周末时间容量生成的每日任务。用户选择的书：${body.books.join('、')}。不得改动日期、阅读时间或章节范围；只补充简洁的学习重点与成果。每周生成 focus（不超过16个中文字）和 outcome（不超过45个中文字）；每个有阅读任务的日期生成 focus（不超过14个中文字）和 outcome（不超过28个中文字）。若某天没有阅读任务，不要为它生成 dailySummaries。成果要说明当天可掌握的知识或判断，不要泛泛谈面试。只返回合法 JSON，不要 markdown：{"weeks":12,"weekdayTime":"...","weekendTime":"...","background":"...","goal":"...","weeklySummaries":[{"week":1,"focus":"...","outcome":"..."}],"dailySummaries":[{"week":1,"day":1,"focus":"...","outcome":"..."}]}。weeks 必须是 2-52 的整数；对用户明确给出的周期和时间必须原样尊重。\n\n用户描述：${body.brief}\n\n每周章节安排：${JSON.stringify(body.draftSchedule || [])}\n\n每日安排：${JSON.stringify(body.draftDailySchedule || [])}`;
     const endpoint =
       body.provider === 'deepseek'
         ? 'https://api.deepseek.com/chat/completions'
@@ -40,7 +41,7 @@ export async function POST(request: Request) {
         stream: false,
         thinking: { type: body.thinking || 'disabled' },
         reasoning_effort: body.reasoningEffort || 'low',
-        max_tokens: 900,
+        max_tokens: 1400,
         response_format: { type: 'json_object' },
       }),
     });
