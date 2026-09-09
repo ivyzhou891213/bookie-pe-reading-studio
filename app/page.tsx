@@ -130,7 +130,7 @@ type PlannedDay = {
   date: string;
   label: string;
   time: string;
-  tasks: { bookId: string; start: number; end: number }[];
+  tasks: { bookId: string; start: number; end: number; part?: string }[];
 };
 type ArchiveMeta = {
   folder: string;
@@ -396,6 +396,18 @@ function formatOcrDuration(seconds: number) {
   const minutes = Math.ceil(rounded / 60);
   return minutes < 60 ? `约 ${minutes} 分钟` : `约 ${Math.ceil(minutes / 60)} 小时`;
 }
+function localDateKey(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+function scheduleBookLabel(book?: Book) {
+  const title = book?.title || '书籍';
+  if (/investment banking/i.test(title)) return 'Investment Banking';
+  if (/mckinsey valuation|measuring and managing the value/i.test(title)) return 'McKinsey Valuation';
+  return title.length > 32 ? `${title.slice(0, 32)}…` : title;
+}
 function scheduleHours(value: string, fallback: number) {
   const numeric = value.match(/(\d+(?:\.\d+)?)\s*(?:小时|h\b)/i);
   if (numeric) return Number(numeric[1]);
@@ -412,7 +424,18 @@ function dailyRowsForSchedule(schedule: PlannedWeek[], startDate: string, weekda
   const weekendHours = scheduleHours(weekendTime, 2);
   const weekdayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
   return schedule.flatMap((week, weekIndex) => {
-    const reading = week.units.flatMap((unit) => unit.chapterNos.map((chapter) => ({ bookId: unit.bookId, chapter })));
+    const rawReading = week.units.flatMap((unit) => unit.chapterNos.map((chapter) => ({ bookId: unit.bookId, chapter })));
+    // A daily plan must cover every available day. When a short chapter allocation
+    // has fewer than seven entries, divide those chapters into consecutive study blocks.
+    const segmentCount = rawReading.length ? Math.max(7, rawReading.length) : 0;
+    const chapterOccurrences = new Map<string, number>();
+    const reading = Array.from({ length: segmentCount }, (_, index) => {
+      const source = rawReading[Math.min(rawReading.length - 1, Math.floor((index * rawReading.length) / segmentCount))];
+      const key = `${source.bookId}:${source.chapter}`;
+      chapterOccurrences.set(key, (chapterOccurrences.get(key) || 0) + 1);
+      return { ...source, key };
+    });
+    const chapterPositions = new Map<string, number>();
     const weekStart = new Date(`${startDate}T00:00:00`);
     weekStart.setDate(weekStart.getDate() + weekIndex * 7);
     const weights = Array.from({ length: 7 }, (_, day) => {
@@ -439,9 +462,13 @@ function dailyRowsForSchedule(schedule: PlannedWeek[], startDate: string, weekda
       const items = reading.slice(cursor, cursor + count);
       cursor += count;
       const tasks = items.reduce<PlannedDay['tasks']>((groups, item) => {
+        const position = (chapterPositions.get(item.key) || 0) + 1;
+        chapterPositions.set(item.key, position);
+        const totalParts = chapterOccurrences.get(item.key) || 1;
+        const part = totalParts > 1 ? `${position}/${totalParts}` : undefined;
         const last = groups.at(-1);
-        if (last && last.bookId === item.bookId && last.end + 1 === item.chapter) last.end = item.chapter;
-        else groups.push({ bookId: item.bookId, start: item.chapter, end: item.chapter });
+        if (last && !part && last.bookId === item.bookId && last.end + 1 === item.chapter) last.end = item.chapter;
+        else groups.push({ bookId: item.bookId, start: item.chapter, end: item.chapter, part });
         return groups;
       }, []);
       const date = new Date(weekStart);
@@ -450,7 +477,7 @@ function dailyRowsForSchedule(schedule: PlannedWeek[], startDate: string, weekda
       return {
         week: week.week,
         day: day + 1,
-        date: date.toISOString().slice(0, 10),
+        date: localDateKey(date),
         label: weekdayLabels[(calendarDay + 6) % 7],
         time: calendarDay === 0 || calendarDay === 6 ? weekendTime : formatStudyTime(weekdayTime),
         tasks,
@@ -690,6 +717,7 @@ export default function Home() {
     '我有小型 PE 基金的基础设施和跨境投资经验。希望在 12 周内系统掌握 McKinsey Valuation 和 Investment Banking，用于跳槽大型 PE 平台。工作日晚上 10 点到 12 点，周末每天可投入 2 到 3 小时。',
   );
   const [planPreview, setPlanPreview] = useState<StudyPlan | null>(null);
+  const [planGenerating, setPlanGenerating] = useState(false);
   const [plannerListening, setPlannerListening] = useState(false);
   const [importKind, setImportKind] = useState<'interview' | 'deal'>(
     'interview',
@@ -967,7 +995,7 @@ export default function Home() {
     start.setDate(start.getDate() + (week - 1) * 7);
     const end = new Date(start);
     end.setDate(end.getDate() + 6);
-    const format = (date: Date) => date.toISOString().slice(0, 10).replace(/-/g, '.');
+    const format = (date: Date) => localDateKey(date).replace(/-/g, '.');
     return `${format(start)} – ${format(end)}`;
   }
   function compactPlanGoal(plan: StudyPlan) {
@@ -1083,6 +1111,9 @@ export default function Home() {
       setPlanError(language === 'zh' ? `「${incompleteBook.title}」目前只识别到 ${chaptersFor(incompleteBook.id).length} 个章节，无法生成可靠计划。请先在书架点击“重建目录”；若文字层不足，页面会提示你再做整书 OCR。` : `“${incompleteBook.title}” has only ${chaptersFor(incompleteBook.id).length} detected chapters, which is not enough for a reliable plan. Rebuild its contents from the shelf first; use full-book OCR only if its text layer is insufficient.`);
       return;
     }
+    setPlanGenerating(true);
+    setPlanError('');
+    try {
     const weekMatch = planBrief.match(/(\d{1,2})\s*(?:周|weeks?)/i);
     const monthMatch = planBrief.match(/([一二两三四五六]|\d+)\s*个?月/);
     const chineseMonths: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6 };
@@ -1102,9 +1133,13 @@ export default function Home() {
           : ({ 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5 }[durationMatch[1]] || Number(durationMatch[1]))
       : null;
     if (explicitDailyHours !== null && !anyClock) weekdayTime = `每天 ${explicitDailyHours} 小时`;
-    let weekendTime = /周末/.test(planBrief)
-      ? '周末：按你的描述安排'
-      : planWeekendTime;
+    const weekendSegment = planBrief.match(/(?:周末|周六|周日)([^。；;]*)/)?.[1] || '';
+    const weekendDuration = weekendSegment.match(/(\d+(?:\.\d+)?)\s*(?:小时|h\b)/i);
+    let weekendTime = weekendDuration
+      ? `每天 ${weekendDuration[1]} 小时`
+      : /周末/.test(planBrief)
+        ? '周末 2–3 小时'
+        : planWeekendTime;
     let background = planBrief;
     let goal = planBrief;
     let schedule = buildSchedule(planBooks, weeks, weekdayTime, weekendTime);
@@ -1182,11 +1217,7 @@ export default function Home() {
       id: editingPlanId || `plan-${Date.now()}`,
       name: planName.trim() || '未命名学习计划',
       startDate: planStartDate,
-      endDate: new Date(
-        new Date(`${planStartDate}T00:00:00`).getTime() + weeks * 7 * 86400000,
-      )
-        .toISOString()
-        .slice(0, 10),
+      endDate: localDateKey(new Date(new Date(`${planStartDate}T00:00:00`).getTime() + weeks * 7 * 86400000)),
       bookIds: planBooks,
       weeks,
       weekdayTime,
@@ -1209,6 +1240,9 @@ export default function Home() {
     };
     setPlanWeeks(weeks);
     setPlanPreview(preview);
+    } finally {
+      setPlanGenerating(false);
+    }
   }
   function listenPlanBrief() {
     const Recognition =
@@ -2708,6 +2742,7 @@ export default function Home() {
               setBrief={setPlanBrief}
               preview={planPreview}
               onPreview={extractPlanFromBrief}
+              generating={planGenerating}
               onListen={listenPlanBrief}
               listening={plannerListening}
               planName={planName}
@@ -3847,11 +3882,11 @@ function DailyStudyCalendar({ plan, books }: { plan: StudyPlan; books: Book[] })
                 <p className="mt-2 text-xs font-semibold leading-5 text-[var(--ink)]">
                   {day.tasks.map((task) => {
                     const book = books.find((item) => item.id === task.bookId);
-                    return `${book?.short || book?.title || '书'} · Ch.${task.start}${task.end !== task.start ? `–Ch.${task.end}` : ''}`;
+                    return `${scheduleBookLabel(book)} · Ch.${task.start}${task.end !== task.start ? `–Ch.${task.end}` : ''}${task.part ? `（第 ${task.part} 段）` : ''}`;
                   }).join('；')}
                 </p>
                 <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{guidance?.focus || week.focus}{guidance?.outcome ? `：${guidance.outcome}` : ''}</p>
-              </> : <p className="mt-3 text-xs leading-5 text-[var(--muted)]">复盘、整理问题或休息</p>}
+              </> : <p className="mt-3 text-xs leading-5 text-[var(--muted)]">本周没有可分配章节</p>}
             </article>;
           })}
         </div>
@@ -3868,6 +3903,7 @@ function PlannerModal({
   setBrief,
   preview,
   onPreview,
+  generating,
   onListen,
   listening,
   planName,
@@ -3885,6 +3921,7 @@ function PlannerModal({
   setBrief: (v: string) => void;
   preview: StudyPlan | null;
   onPreview: () => void;
+  generating: boolean;
   onListen: () => void;
   listening: boolean;
   planName: string;
@@ -3986,12 +4023,13 @@ function PlannerModal({
             className="mt-4 min-h-32 w-full resize-y rounded-2xl border border-[var(--line)] bg-white p-4 leading-7 outline-none"
           />
           <button
-            disabled={!selected.length || !brief.trim()}
+            disabled={!selected.length || !brief.trim() || generating}
             onClick={onPreview}
             className="mt-4 rounded-full bg-[var(--ink)] px-5 py-3 text-sm font-semibold text-white disabled:opacity-40"
           >
-            生成计划预览
+            {generating ? '正在生成 · 通常约 10–25 秒' : preview ? '重新生成计划预览' : '生成计划预览'}
           </button>
+          {generating && <p className="mt-3 text-sm font-medium text-[var(--green)]">正在按你的日期、工作日/周末时长和两本书目录生成最终版本，请勿重复点击。</p>}
         </section>
         {preview && (
           <section className="mt-5 rounded-[28px] border border-[var(--line)] bg-white p-5">
