@@ -1116,22 +1116,27 @@ export default function Home() {
     baseline: PlannedDay[],
     bookIds: string[],
   ): PlannedDay[] | null {
-    if (!Array.isArray(candidate) || candidate.length !== baseline.length) return null;
+    if (!Array.isArray(candidate)) return null;
     const expected = new Set(bookIds.flatMap((bookId) => chaptersFor(bookId).map((chapter) => `${bookId}:${chapter.n}`)));
     const seen = new Set<string>();
     const lastChapter = new Map<string, number>();
-    const normalized = baseline.map((base, index) => {
-      const row = candidate[index] as { week?: number; day?: number; tasks?: unknown; outcome?: unknown };
-      if (Number(row?.week) !== base.week || Number(row?.day) !== base.day || !Array.isArray(row?.tasks)) return null;
-      const tasks = row.tasks.flatMap((raw) => {
-        const task = raw as { bookId?: unknown; start?: unknown; end?: unknown };
+    const normalized = baseline.map((base) => {
+      const row = candidate.find((item) => {
+        const value = item as { week?: unknown; day?: unknown };
+        return Number(value.week) === base.week && Number(value.day) === base.day;
+      }) as { tasks?: unknown; outcome?: unknown } | undefined;
+      if (!row || !Array.isArray(row.tasks)) return null;
+      const tasks: PlannedDay['tasks'] = [];
+      for (const raw of row.tasks) {
+        const task = raw as { bookId?: unknown; start?: unknown; end?: unknown; chapter?: unknown; chapters?: unknown };
         const bookId = String(task.bookId || '');
-        const start = Number(task.start);
-        const end = Number(task.end ?? task.start);
-        if (!bookIds.includes(bookId) || !Number.isInteger(start) || !Number.isInteger(end) || end < start) return [];
-        return [{ bookId, start, end }];
-      });
-      if (tasks.length !== row.tasks.length) return null;
+        const range = String(task.chapters || task.chapter || '');
+        const numbers = range.match(/\d+/g)?.map(Number) || [];
+        const start = Number(task.start ?? numbers[0]);
+        const end = Number(task.end ?? numbers.at(-1) ?? task.start ?? numbers[0]);
+        if (!bookIds.includes(bookId) || !Number.isInteger(start) || !Number.isInteger(end) || end < start) return null;
+        tasks.push({ bookId, start, end });
+      }
       for (const task of tasks) {
         for (let chapter = task.start; chapter <= task.end; chapter += 1) {
           const key = `${task.bookId}:${chapter}`;
@@ -1230,11 +1235,7 @@ export default function Home() {
     const key = ai.apiKey;
     if (key) {
       try {
-        const chapterContexts = await extractPlanChapterContexts(schedule);
-        const response = await fetch('/api/planner', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+        const plannerPayload = {
             provider: ai.provider,
             model: ai.model,
             apiKey: key,
@@ -1268,10 +1269,14 @@ export default function Home() {
                 chapters: task.start === task.end ? `Ch.${task.start}` : `Ch.${task.start}–Ch.${task.end}`,
               })),
             })),
-            chapterContexts,
-          }),
-        });
-        const data = (await response.json()) as {
+          };
+        const requestPlan = async (repair = false) => {
+          const response = await fetch('/api/planner', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...plannerPayload, repair }),
+          });
+          return { response, data: (await response.json()) as {
           extracted?: {
             weeks?: number;
             weekdayTime?: string;
@@ -1282,7 +1287,20 @@ export default function Home() {
             dailySummaries?: Array<{ week: number; day: number; focus?: string; outcome?: string }>;
             dailySchedule?: Array<{ week: number; day: number; tasks: Array<{ bookId: string; start: number; end: number }>; outcome?: string }>;
           };
+          }};
         };
+        let { response, data } = await requestPlan();
+        let acceptedDailySchedule = response.ok
+          ? validateAiDailySchedule(data.extracted?.dailySchedule, baselineDays, planBooks)
+          : null;
+        // Models occasionally return an otherwise good answer with one malformed
+        // row. Repair it silently once, instead of asking the learner to retry.
+        if (!acceptedDailySchedule && response.ok) {
+          ({ response, data } = await requestPlan(true));
+          acceptedDailySchedule = response.ok
+            ? validateAiDailySchedule(data.extracted?.dailySchedule, baselineDays, planBooks)
+            : null;
+        }
         if (response.ok && data.extracted) {
           weeks = Math.max(
             2,
@@ -1298,19 +1316,20 @@ export default function Home() {
               return ai ? { ...week, focus: ai.focus || week.focus, outcome: ai.outcome || week.outcome, aiOutcome: ai.outcome } : week;
             });
           }
-          const acceptedDailySchedule = validateAiDailySchedule(data.extracted.dailySchedule, baselineDays, planBooks);
           if (acceptedDailySchedule) {
             dailySchedule = acceptedDailySchedule;
             dailyGuidance = acceptedDailySchedule.map((day) => ({ week: day.week, day: day.day, outcome: day.outcome }));
             aiPlanApplied = true;
           } else {
-            setPlanError('AI 返回的排程遗漏、重复或跳过了章节；为保证四周完成整本书，系统没有采用这份排程。请重新生成。');
+            dailySchedule = baselineDays;
+            setPlanError('AI 排程格式异常，系统已自动尝试修复；目前展示的是保证完整覆盖的保底安排。你仍可直接确认使用。');
           }
         } else if (!response.ok) {
           setPlanError((data as { error?: string }).error || 'AI 计划生成未完成，请检查 API Key 后重试。');
         }
       } catch {
-        setPlanError('无法读取章节内容或连接 AI；已生成基础章节安排，但未生成 AI 学习重点。');
+        dailySchedule = baselineDays;
+        setPlanError('暂时无法连接 AI；目前展示的是保证完整覆盖的保底安排。你仍可直接确认使用。');
       }
     }
     if (explicitDailyHours !== null && !anyClock) weekdayTime = `每天 ${explicitDailyHours} 小时`;
