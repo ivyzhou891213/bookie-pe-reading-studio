@@ -43,6 +43,7 @@ type Book = {
   ocrRequired?: boolean;
   ocrReady?: boolean;
   ocrTextReady?: boolean;
+  textLayerReady?: boolean;
 };
 type QA = {
   id: string;
@@ -630,6 +631,7 @@ export default function Home() {
   const [uploadingBook, setUploadingBook] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const [ocrIndexingBookId, setOcrIndexingBookId] = useState<string | null>(null);
+  const [indexingMode, setIndexingMode] = useState<'contents' | 'ocr' | null>(null);
   const [ocrProgress, setOcrProgress] = useState<{ current: number; total: number; startedAt: number } | null>(null);
   const handlePdfSelection = useCallback((text: string, fullSentence: string) => {
     setSelection(text);
@@ -646,7 +648,14 @@ export default function Home() {
       ...loaded,
       uploadedBooks: loaded.uploadedBooks.map((item) =>
         item.file.startsWith('local:')
-          ? { ...item, title: cleanUploadedBookTitle(item.title) }
+          ? {
+              ...item,
+              title: cleanUploadedBookTitle(item.title),
+              // Two headings are not a reliable table of contents for a full book.
+              ...(item.chapters && item.chapters.length < 4 && !item.ocrTextReady
+                ? { ocrRequired: true, ocrReady: false }
+                : {}),
+            }
           : item,
       ),
     });
@@ -998,9 +1007,9 @@ export default function Home() {
     });
   }
   async function extractPlanFromBrief() {
-    const scannedBook = planBooks.map((id) => books.find((book) => book.id === id)).find((book) => book?.file.startsWith('local:') && !book.ocrTextReady && (book.ocrRequired || chaptersFor(book.id).length <= 1));
-    if (scannedBook) {
-      setPlanError(language === 'zh' ? `「${scannedBook.title}」是扫描版。请先在书架点击“一键 OCR 整本书”，识别目录后再生成计划。` : `“${scannedBook.title}” is scanned. Run full-book OCR from your shelf to identify its table of contents before creating a plan.`);
+    const incompleteBook = planBooks.map((id) => books.find((book) => book.id === id)).find((book) => book?.file.startsWith('local:') && chaptersFor(book.id).length < 4);
+    if (incompleteBook) {
+      setPlanError(language === 'zh' ? `「${incompleteBook.title}」目前只识别到 ${chaptersFor(incompleteBook.id).length} 个章节，无法生成可靠计划。请先在书架点击“重建目录”；若文字层不足，页面会提示你再做整书 OCR。` : `“${incompleteBook.title}” has only ${chaptersFor(incompleteBook.id).length} detected chapters, which is not enough for a reliable plan. Rebuild its contents from the shelf first; use full-book OCR only if its text layer is insufficient.`);
       return;
     }
     const weekMatch = planBrief.match(/(\d{1,2})\s*(?:周|weeks?)/i);
@@ -1378,7 +1387,8 @@ export default function Home() {
         }
       });
       const chapters = found.sort((a, b) => a.n - b.n);
-      const ocrRequired = !samples.join('').replace(/\s/g, '').length || chapters.length < 2;
+      const textLayerReady = !!samples.join('').replace(/\s/g, '').length;
+      const ocrRequired = !textLayerReady || chapters.length < 4;
       const data: { book: Book } = {
         book: {
           id,
@@ -1391,6 +1401,7 @@ export default function Home() {
           chapters: chapters.length ? chapters : [{ n: 1, title: ocrRequired ? '等待 OCR 识别目录' : '完整阅读', page: 1 }],
           ocrRequired,
           ocrReady: !ocrRequired,
+          textLayerReady,
         },
       };
       CHAPTERS[id] = data.book.chapters || [];
@@ -1410,6 +1421,7 @@ export default function Home() {
   async function ocrBookContents(target: Book) {
     if (!target.file.startsWith('local:')) return;
     setOcrIndexingBookId(target.id);
+    setIndexingMode('ocr');
     setUploadError('');
     try {
       const file = await loadLocalPdf(target.id);
@@ -1447,7 +1459,10 @@ export default function Home() {
       }
       await worker.terminate();
       setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrRequired: false, ocrTextReady: true } : book) }));
-      if (found.length < 2) throw new Error('整本书 OCR 已完成，但没有识别到可靠章节目录。请使用更清晰的 PDF，或补充带目录页的版本。');
+      if (found.length < 4) {
+        setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrReady: false, ocrTextReady: true } : book) }));
+        throw new Error('整书 OCR 已完成，但只识别到不足 4 个章节，不能据此生成可靠计划。建议换用带清晰目录页的 PDF。');
+      }
       const chapters = found.sort((a, b) => a.n - b.n);
       CHAPTERS[target.id] = chapters;
       setStore((s) => ({
@@ -1462,6 +1477,53 @@ export default function Home() {
     } finally {
       setOcrIndexingBookId(null);
       setOcrProgress(null);
+      setIndexingMode(null);
+    }
+  }
+  async function rebuildBookContents(target: Book) {
+    if (!target.file.startsWith('local:')) return;
+    setOcrIndexingBookId(target.id);
+    setIndexingMode('contents');
+    setUploadError('');
+    try {
+      const file = await loadLocalPdf(target.id);
+      if (!file) throw new Error('找不到本机文件，请重新上传。');
+      const pdfjs = await import('pdfjs-dist');
+      pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+      const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+      const found: Chapter[] = [];
+      const startedAt = Date.now();
+      setOcrProgress({ current: 0, total: pdf.numPages, startedAt });
+      for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
+        const pdfPage = await pdf.getPage(pageNo);
+        const content = await pdfPage.getTextContent();
+        const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ');
+        const matcher = /(?:chapter|chap\.?|ch\.?|第)\s*(\d{1,3}|[一二三四五六七八九十]{1,3})\s*(?:章)?\s*[:：.\-–]?\s*([^\n]{3,100})/gi;
+        for (const match of text.matchAll(matcher)) {
+          const chapter = chapterFromLine(match[0], pageNo, pdf.numPages);
+          if (chapter && !found.some((item) => item.n === chapter.n)) found.push(chapter);
+        }
+        setOcrProgress({ current: pageNo, total: pdf.numPages, startedAt });
+      }
+      const chapters = found.sort((a, b) => a.n - b.n);
+      if (chapters.length < 4) {
+        setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrRequired: true, ocrReady: false, textLayerReady: false } : book) }));
+        throw new Error('这本书的文字层无法提供可靠目录。请使用“整书 OCR”识别后再生成学习计划。');
+      }
+      CHAPTERS[target.id] = chapters;
+      setStore((s) => ({
+        ...s,
+        uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, chapters, ocrRequired: false, ocrReady: true, textLayerReady: true } : book),
+        studyPlans: s.studyPlans.map((plan) => plan.bookIds.includes(target.id)
+          ? { ...plan, schedule: buildSchedule(plan.bookIds, plan.weeks, plan.weekdayTime, plan.weekendTime) }
+          : plan),
+      }));
+    } catch (indexError) {
+      setUploadError(indexError instanceof Error ? indexError.message : '目录重建失败。');
+    } finally {
+      setOcrIndexingBookId(null);
+      setOcrProgress(null);
+      setIndexingMode(null);
     }
   }
   async function extractFormulasFromBook() {
@@ -2443,11 +2505,11 @@ export default function Home() {
                 const remaining = ocrProgress.current ? (elapsed / ocrProgress.current) * (ocrProgress.total - ocrProgress.current) : 0;
                 return <div className="mb-4 rounded-2xl border border-[var(--green)]/25 bg-[#edf5ef] p-4">
                   <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                    <p className="font-semibold text-[var(--ink)]">{language === 'zh' ? `正在 OCR《${target?.title || '这本书'}》` : `OCR in progress: ${target?.title || 'this book'}`}</p>
+                    <p className="font-semibold text-[var(--ink)]">{indexingMode === 'contents' ? (language === 'zh' ? `正在重建《${target?.title || '这本书'}》的目录` : `Rebuilding contents: ${target?.title || 'this book'}`) : (language === 'zh' ? `正在 OCR《${target?.title || '这本书'}》` : `OCR in progress: ${target?.title || 'this book'}`)}</p>
                     <p className="text-sm font-medium text-[var(--green)]">{ocrProgress.current} / {ocrProgress.total} {language === 'zh' ? '页' : 'pages'} · {percent}%</p>
                   </div>
                   <div className="mt-3 h-2 overflow-hidden rounded-full bg-white"><div className="h-full rounded-full bg-[var(--green)] transition-[width] duration-500" style={{ width: `${percent}%` }} /></div>
-                  <p className="mt-2 text-xs leading-5 text-[var(--muted)]">{ocrProgress.current === 0 ? (language === 'zh' ? '正在启动识别引擎；首张页面完成后会计算预计剩余时间。' : 'Starting the OCR engine. An estimated remaining time appears after the first page.') : (language === 'zh' ? `预计还需 ${formatOcrDuration(remaining)}。已完成的页面会保存；中断后再次开始将从未完成页面继续。` : `About ${formatOcrDuration(remaining)} remaining. Completed pages are saved and a later run resumes unfinished pages.`)}</p>
+                  <p className="mt-2 text-xs leading-5 text-[var(--muted)]">{ocrProgress.current === 0 ? (indexingMode === 'contents' ? (language === 'zh' ? '正在读取 PDF 自带文字层，不会调用 OCR。首页完成后会计算预计剩余时间。' : 'Reading the PDF text layer; OCR is not being used. An estimate appears after the first page.') : (language === 'zh' ? '正在启动识别引擎；首张页面完成后会计算预计剩余时间。' : 'Starting the OCR engine. An estimated remaining time appears after the first page.')) : (indexingMode === 'contents' ? (language === 'zh' ? `预计还需 ${formatOcrDuration(remaining)}。这是快速目录检查，不会重复 OCR。` : `About ${formatOcrDuration(remaining)} remaining. This is a fast contents check and does not repeat OCR.`) : (language === 'zh' ? `预计还需 ${formatOcrDuration(remaining)}。已完成的页面会保存；中断后再次开始将从未完成页面继续。` : `About ${formatOcrDuration(remaining)} remaining. Completed pages are saved and a later run resumes unfinished pages.`))}</p>
                 </div>;
               })()}
               {uploadError && (
@@ -2476,19 +2538,19 @@ export default function Home() {
                         <span className="mt-1 block text-sm text-[var(--muted)]">
                           {language === 'zh' ? `当前第 ${store.progress[b.id] || 1} 页 · 共 ${b.pages} 页` : `Page ${store.progress[b.id] || 1} of ${b.pages}`}
                         </span>
-                        {b.file.startsWith('local:') && b.ocrRequired && !b.ocrTextReady && (
+                        {b.file.startsWith('local:') && chaptersFor(b.id).length < 4 && !b.ocrTextReady && (
                           <span className="mt-1 block text-xs font-medium text-[var(--brown)]">
-                            {language === 'zh' ? '扫描件或低清 PDF：先一键 OCR 整本书，才能识别目录并生成可靠计划。' : 'Scanned or low-resolution PDF: run full-book OCR first to identify its table of contents and create a reliable plan.'}
+                            {language === 'zh' ? `目录待补全：目前仅识别 ${chaptersFor(b.id).length} 个章节。请先重建目录；若文字层不足，再进行整书 OCR。` : `Contents need review: only ${chaptersFor(b.id).length} chapters were detected. Rebuild the contents first; use full-book OCR only if the text layer is insufficient.`}
                           </span>
                         )}
-                        {b.file.startsWith('local:') && b.ocrReady && chaptersFor(b.id).length > 1 && (
+                        {b.file.startsWith('local:') && chaptersFor(b.id).length >= 4 && (
                           <span className="mt-1 block text-xs font-medium text-[var(--green)]">
-                            {language === 'zh' ? `OCR 已完成 · 已识别 ${chaptersFor(b.id).length} 个章节` : `OCR complete · ${chaptersFor(b.id).length} chapters detected`}
+                            {language === 'zh' ? `目录已识别 · ${chaptersFor(b.id).length} 个章节` : `Contents identified · ${chaptersFor(b.id).length} chapters`}
                           </span>
                         )}
                         {b.file.startsWith('local:') && b.ocrTextReady && !b.ocrReady && (
                           <span className="mt-1 block text-xs font-medium text-[var(--green)]">
-                            {language === 'zh' ? 'OCR 已完成 · 文字已保存；目录未能可靠识别，生成计划时会按整书阅读安排。' : 'OCR complete · text saved; the table of contents was not reliably detected, so plans will use whole-book reading.'}
+                            {language === 'zh' ? '整书 OCR 已完成，但目录仍不足 4 章，不能据此生成可靠计划。' : 'Full-book OCR is complete, but fewer than four chapters were identified; a reliable plan cannot be generated from it.'}
                           </span>
                         )}
                         <span className="mt-2 block h-1.5 overflow-hidden rounded-full bg-white">
@@ -2510,7 +2572,16 @@ export default function Home() {
                     >
                       {planBooks.includes(b.id) ? (language === 'zh' ? '已选入计划' : 'In this plan') : (language === 'zh' ? '加入计划' : 'Add to plan')}
                     </button>
-                    {b.file.startsWith('local:') && b.ocrRequired && !b.ocrTextReady && (
+                    {b.file.startsWith('local:') && chaptersFor(b.id).length < 4 && !b.ocrTextReady && b.textLayerReady !== false && (
+                      <button
+                        onClick={() => rebuildBookContents(b)}
+                        disabled={ocrIndexingBookId === b.id}
+                        className="rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
+                      >
+                        {ocrIndexingBookId === b.id ? (language === 'zh' ? `重建目录 ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `Contents ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '重建目录' : 'Rebuild contents')}
+                      </button>
+                    )}
+                    {b.file.startsWith('local:') && chaptersFor(b.id).length < 4 && !b.ocrTextReady && b.textLayerReady === false && (
                       <button
                         onClick={() => ocrBookContents(b)}
                         disabled={ocrIndexingBookId === b.id}
@@ -2519,7 +2590,7 @@ export default function Home() {
                         {ocrIndexingBookId === b.id ? (language === 'zh' ? `整书 OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '一键 OCR 整本书' : 'OCR entire book')}
                       </button>
                     )}
-                    {b.file.startsWith('local:') && b.ocrTextReady && (
+                    {b.file.startsWith('local:') && b.ocrTextReady && chaptersFor(b.id).length >= 4 && (
                       <span className="rounded-lg border border-[var(--green)] bg-white px-2.5 py-2 text-xs font-semibold text-[var(--green)]">
                         {language === 'zh' ? '已完成 OCR' : 'OCR complete'}
                       </span>
