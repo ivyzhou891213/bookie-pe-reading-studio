@@ -604,10 +604,7 @@ export default function Home() {
   const [planError, setPlanError] = useState('');
   const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
   const [language, setLanguage] = useState<'zh' | 'en'>('zh');
-  const [planBooks, setPlanBooks] = useState<string[]>([
-    'valuation',
-    'investment-banking',
-  ]);
+  const [planBooks, setPlanBooks] = useState<string[]>([]);
   const [planWeeks, setPlanWeeks] = useState(12);
   const [planWeekdayTime, setPlanWeekdayTime] = useState('22:00–24:00');
   const [planWeekendTime, setPlanWeekendTime] = useState('周六/周日 2–3 小时');
@@ -759,6 +756,15 @@ export default function Home() {
       ),
     [hostedMode, store.uploadedBooks, store.archivedBooks],
   );
+  useEffect(() => {
+    const available = new Set(books.map((item) => item.id));
+    setPlanBooks((current) => {
+      const valid = current.filter((id) => available.has(id));
+      // New plans start from the visible shelf. This also removes stale IDs
+      // left by the local demo books when the hosted library changes.
+      return valid.length ? valid : books.slice(0, 2).map((item) => item.id);
+    });
+  }, [books]);
   const activePlan =
     store.studyPlans.find((plan) => plan.id === store.activePlanId) ||
       store.studyPlans[0];
@@ -1227,6 +1233,12 @@ export default function Home() {
       setPlanWeekdayTime(target.weekdayTime);
       setPlanWeekendTime(target.weekendTime);
       setPlanBrief(target.conversation?.at(-1)?.text || target.goal);
+    } else {
+      const available = new Set(books.map((item) => item.id));
+      setPlanBooks((current) => {
+        const valid = current.filter((id) => available.has(id));
+        return valid.length ? valid : books.slice(0, 2).map((item) => item.id);
+      });
     }
     setShowPlanner(true);
   }
@@ -3719,6 +3731,7 @@ function PlannerModal({
             <h2 className="mt-1 text-2xl font-semibold">
               先选书，再告诉 AI 你想去哪里。
             </h2>
+            <p className="mt-2 text-sm text-[var(--muted)]">已选择 {selected.length} / 3 本书；点击书籍卡片可多选或取消。</p>
           </div>
           <button onClick={onClose} className="rounded-xl bg-white p-2">
             <X className="size-5" />
