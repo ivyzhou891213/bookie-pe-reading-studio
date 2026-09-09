@@ -186,6 +186,7 @@ type Store = {
   archivedBooks: Record<string, boolean>;
 };
 type Chapter = { n: number; title: string; page: number };
+type DetectedChapter = Chapter & { tocLike: boolean };
 type WeekPlan = {
   week: number;
   theme: string;
@@ -377,7 +378,7 @@ function chapterNumber(value: string) {
   if (value.length === 3 && digits[value[0]] && value[1] === '十' && digits[value[2]]) return digits[value[0]] * 10 + digits[value[2]];
   return digits[value];
 }
-function chapterFromLine(line: string, sourcePage: number, totalPages: number): Chapter | null {
+function chapterFromLine(line: string, sourcePage: number, totalPages: number): DetectedChapter | null {
   const match = line.match(/(?:chapter|chap\.?|ch\.?|第)\s*(\d{1,3}|[一二三四五六七八九十]{1,3})\s*(?:章)?\s*[:：.\-–]?\s*(.{3,90})/i);
   if (!match) return null;
   const n = chapterNumber(match[1]);
@@ -386,7 +387,47 @@ function chapterFromLine(line: string, sourcePage: number, totalPages: number): 
   const title = rawTitle.replace(/(?:\.{2,}|\s)\d{1,4}\s*$/, '').trim();
   if (!n || !isUsableChapter(title)) return null;
   const listedPage = pageMatch ? Number(pageMatch[1]) : 0;
-  return { n, title, page: listedPage > 0 && listedPage <= totalPages ? listedPage : sourcePage };
+  // A number printed at the end of a contents row is a book page number, not a
+  // PDF index. Persist the page on which the heading was actually found. Full
+  // scans prefer a real heading over an earlier contents-row candidate.
+  return { n, title, page: sourcePage, tocLike: listedPage > 0 && listedPage <= totalPages };
+}
+function rememberChapter(found: Map<number, DetectedChapter>, candidate: DetectedChapter) {
+  const previous = found.get(candidate.n);
+  if (!previous || (previous.tocLike && !candidate.tocLike)) found.set(candidate.n, candidate);
+}
+function storedChapters(found: Map<number, DetectedChapter>): Chapter[] {
+  return [...found.values()]
+    .sort((a, b) => a.n - b.n)
+    .map(({ n, title, page }) => ({ n, title, page }));
+}
+function textContentLines(items: readonly unknown[]) {
+  const lines: string[] = [];
+  let line = '';
+  for (const raw of items) {
+    if (!raw || typeof raw !== 'object' || !('str' in raw) || typeof raw.str !== 'string' || !raw.str) continue;
+    line += `${line ? ' ' : ''}${raw.str}`;
+    if ('hasEOL' in raw && raw.hasEOL) { lines.push(line); line = ''; }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+function scheduleCoversBooks(schedule: PlannedWeek[] | undefined, bookIds: string[]) {
+  if (!schedule?.length) return false;
+  const expected = new Set(bookIds.flatMap((bookId) => chaptersFor(bookId).map((chapter) => `${bookId}:${chapter.n}`)));
+  const actual = schedule.flatMap((week) => week.units.flatMap((unit) => unit.chapterNos.map((chapter) => `${unit.bookId}:${chapter}`)));
+  return actual.length === expected.size && new Set(actual).size === expected.size && actual.every((key) => expected.has(key));
+}
+function dailyScheduleCoversBooks(days: PlannedDay[] | undefined, bookIds: string[]) {
+  if (!days?.length) return false;
+  const expected = new Set(bookIds.flatMap((bookId) => chaptersFor(bookId).map((chapter) => `${bookId}:${chapter.n}`)));
+  const seen = new Set<string>();
+  for (const day of days) for (const task of day.tasks) for (let chapter = task.start; chapter <= task.end; chapter += 1) {
+    const key = `${task.bookId}:${chapter}`;
+    if (!expected.has(key)) return false;
+    seen.add(key);
+  }
+  return seen.size === expected.size;
 }
 function formatStudyTime(value: string) {
   const match = value.match(/(\d{1,2})(?::(\d{2}))?\s*(?:点)?\s*(?:到|[-–—])\s*(\d{1,2})(?::(\d{2}))?\s*(?:点)?/);
@@ -449,18 +490,27 @@ function dailyRowsForSchedule(schedule: PlannedWeek[], startDate: string, weekda
     });
     const allocation = Array(7).fill(0) as number[];
     if (reading.length >= 7) {
-      allocation.fill(1);
-      let remaining = reading.length - 7;
-      while (remaining > 0) {
-        // Allocate the next chapter to the day with the lowest load relative
-        // to its available hours, so both weekend days receive more work.
-        const target = weights.reduce((best, weight, candidate) =>
-          allocation[candidate] / Math.max(0.25, weight) < allocation[best] / Math.max(0.25, weights[best])
-            ? candidate
-            : best,
-        0);
-        allocation[target] += 1;
-        remaining -= 1;
+      const pageWeight = (item: { bookId: string; chapter: number }) => {
+        const chapters = chaptersFor(item.bookId);
+        const index = chapters.findIndex((chapter) => chapter.n === item.chapter);
+        const bookPages = BOOKS.find((book) => book.id === item.bookId)?.pages || chapters.at(-1)?.page || 1;
+        return Math.max(1, (chapters[index + 1]?.page || bookPages + 1) - (chapters[index]?.page || 1));
+      };
+      const work = reading.map(pageWeight);
+      const totalWork = work.reduce((sum, value) => sum + value, 0);
+      const totalCapacity = weights.reduce((sum, value) => sum + Math.max(0.25, value), 0);
+      let cursor = 0;
+      let assignedWork = 0;
+      let capacityUsed = 0;
+      for (let day = 0; day < 7; day += 1) {
+        capacityUsed += Math.max(0.25, weights[day]);
+        const targetWork = totalWork * (capacityUsed / totalCapacity);
+        const remainingDays = 6 - day;
+        while (cursor < reading.length - remainingDays && (allocation[day] === 0 || assignedWork < targetWork)) {
+          assignedWork += work[cursor];
+          allocation[day] += 1;
+          cursor += 1;
+        }
       }
     } else {
       [...reading.keys()].forEach((index) => {
@@ -854,6 +904,31 @@ export default function Home() {
       if (item.chapters?.length) CHAPTERS[item.id] = item.chapters;
     });
   }, [store.uploadedBooks]);
+  // Older plans may contain the former partial-coverage schedule, or a daily
+  // schedule based on chapter pages that were later rebuilt. Keep the plan and
+  // completion history, but regenerate only the derived schedule fields.
+  useEffect(() => {
+    if (!ready) return;
+    setStore((current) => {
+      let changed = false;
+      const studyPlans = current.studyPlans.map((plan) => {
+        const weeklyValid = scheduleCoversBooks(plan.schedule, plan.bookIds);
+        const dailyValid = dailyScheduleCoversBooks(plan.dailySchedule, plan.bookIds);
+        if (weeklyValid && (!plan.dailySchedule || dailyValid)) return plan;
+        changed = true;
+        return {
+          ...plan,
+          schedule: weeklyValid
+            ? plan.schedule
+            : buildSchedule(plan.bookIds, plan.weeks, plan.weekdayTime, plan.weekendTime),
+          dailySchedule: undefined,
+          dailyGuidance: [],
+          aiPlanApplied: false,
+        };
+      });
+      return changed ? { ...current, studyPlans } : current;
+    });
+  }, [ready, store.uploadedBooks]);
   useEffect(() => {
     if (!ready) return;
     let active = true;
@@ -1081,11 +1156,8 @@ export default function Home() {
         // that date, then may distribute these chapters between weekdays and
         // weekends. It may never discard a chapter from this list.
         const start = Math.floor((index * chapters.length) / weeks);
-        const end = Math.max(
-          start,
-          Math.ceil(((index + 1) * chapters.length) / weeks) - 1,
-        );
-        const chosen = chapters.slice(start, end + 1);
+        const endExclusive = Math.floor(((index + 1) * chapters.length) / weeks);
+        const chosen = chapters.slice(start, Math.max(start, endExclusive));
         return {
           bookId,
           chapterNos: chosen.map((x) => x.n),
@@ -1178,7 +1250,7 @@ export default function Home() {
         for (let pageNo = startPage; pageNo <= endPage; pageNo += 1) {
           const page = await pdf.getPage(pageNo);
           const content = await page.getTextContent();
-          const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim() || await loadOcrPage(target.id, pageNo);
+          const text = textContentLines(content.items).join(' ').replace(/\s+/g, ' ').trim() || await loadOcrPage(target.id, pageNo);
           if (text) pages.push(text);
         }
         const text = pages.join(' ').slice(0, 700);
@@ -1206,6 +1278,15 @@ export default function Home() {
     const weekdaySegment = planBrief.match(/(?:工作日|平时|周一至周五)([^。；;]*)/)?.[1] || '';
     const anyClock = weekdaySegment.match(/([0-9一二三四五六七八九十]+\s*(?:点|:00)?\s*(?:到|[-–—])\s*[0-9一二三四五六七八九十]+\s*(?:点|:00)?)/);
     let weekdayTime = anyClock?.[1] || planWeekdayTime;
+    if (anyClock && /晚上|夜间/.test(weekdaySegment)) {
+      const clockParts = anyClock[1].match(/(\d{1,2})\D+(\d{1,2})/);
+      if (clockParts) {
+        const startHour = Number(clockParts[1]) < 12 ? Number(clockParts[1]) + 12 : Number(clockParts[1]);
+        const rawEnd = Number(clockParts[2]);
+        const endHour = rawEnd === 12 ? 24 : rawEnd < 12 ? rawEnd + 12 : rawEnd;
+        weekdayTime = `${String(startHour).padStart(2, '0')}:00–${String(endHour).padStart(2, '0')}:00`;
+      }
+    }
     const durationMatch = weekdaySegment.match(
       /(?:每天|一天)?.*?(一个|半个|[一二两三四五]|\d+(?:\.\d+)?)\s*(?:小时|h\b)/i,
     );
@@ -1302,17 +1383,18 @@ export default function Home() {
             : null;
         }
         if (response.ok && data.extracted) {
+          const extracted = data.extracted;
           weeks = Math.max(
             2,
-            Math.min(52, Number(data.extracted.weeks || weeks)),
+            Math.min(52, Number(extracted.weeks || weeks)),
           );
-          weekdayTime = data.extracted.weekdayTime || weekdayTime;
-          weekendTime = data.extracted.weekendTime || weekendTime;
-          background = data.extracted.background || background;
-          goal = data.extracted.goal || goal;
-          if (data.extracted.weeklySummaries?.length) {
+          weekdayTime = extracted.weekdayTime || weekdayTime;
+          weekendTime = extracted.weekendTime || weekendTime;
+          background = extracted.background || background;
+          goal = extracted.goal || goal;
+          if (extracted.weeklySummaries?.length) {
             schedule = schedule.map((week) => {
-              const ai = data.extracted.weeklySummaries?.find((item) => item.week === week.week);
+              const ai = extracted.weeklySummaries?.find((item) => item.week === week.week);
               return ai ? { ...week, focus: ai.focus || week.focus, outcome: ai.outcome || week.outcome, aiOutcome: ai.outcome } : week;
             });
           }
@@ -1337,7 +1419,7 @@ export default function Home() {
       id: editingPlanId || `plan-${Date.now()}`,
       name: planName.trim() || '未命名学习计划',
       startDate: planStartDate,
-      endDate: localDateKey(new Date(new Date(`${planStartDate}T00:00:00`).getTime() + weeks * 7 * 86400000)),
+      endDate: localDateKey(new Date(new Date(`${planStartDate}T00:00:00`).getTime() + (weeks * 7 - 1) * 86400000)),
       bookIds: planBooks,
       weeks,
       weekdayTime,
@@ -1423,7 +1505,7 @@ export default function Home() {
       startDate: planStartDate,
       endDate: new Date(
         new Date(`${planStartDate}T00:00:00`).getTime() +
-          planWeeks * 7 * 86400000,
+          (planWeeks * 7 - 1) * 86400000,
       )
         .toISOString()
         .slice(0, 10),
@@ -1510,37 +1592,33 @@ export default function Home() {
     replacement: number,
   ) {
     setStore((s) => {
-      const plan = s.studyPlan;
+      const plan = s.studyPlans.find((item) => item.id === s.activePlanId) || s.studyPlans[0];
       if (!plan?.schedule || plan.adjustedWeeks?.[weekNo]) return s;
+      const original = plan.schedule.find((week) => week.week === weekNo)?.units.find((unit) => unit.bookId === bookId)?.chapterNos[chapterIndex];
+      if (!original || original === replacement) return s;
       return {
         ...s,
-        studyPlan: {
-          ...plan,
-          adjustedWeeks: { ...plan.adjustedWeeks, [weekNo]: true },
-          schedule: plan.schedule.map((week) =>
-            week.week !== weekNo
-              ? week
-              : {
-                  ...week,
-                  units: week.units.map((unit) =>
-                    unit.bookId !== bookId
-                      ? unit
-                      : {
-                          ...unit,
-                          chapterNos: unit.chapterNos.map((chapter, index) =>
-                            index === chapterIndex ? replacement : chapter,
-                          ),
-                          summary: unit.chapterNos
-                            .map(
-                              (chapter, index) =>
-                                `Ch.${index === chapterIndex ? replacement : chapter} ${chaptersFor(bookId).find((c) => c.n === (index === chapterIndex ? replacement : chapter))?.title || ''}`,
-                            )
-                            .join(' · '),
-                        },
-                  ),
-                },
-          ),
-        },
+        studyPlans: s.studyPlans.map((item) => item.id !== plan.id ? item : {
+          ...item,
+          adjustedWeeks: { ...item.adjustedWeeks, [weekNo]: true },
+          schedule: item.schedule?.map((week) => ({
+            ...week,
+            units: week.units.map((unit) => unit.bookId !== bookId ? unit : {
+              ...unit,
+              chapterNos: unit.chapterNos.map((chapter, index) =>
+                week.week === weekNo && index === chapterIndex ? replacement : chapter === replacement ? original : chapter,
+              ),
+              summary: unit.chapterNos.map((chapter, index) => {
+                const number = week.week === weekNo && index === chapterIndex ? replacement : chapter === replacement ? original : chapter;
+                return `Ch.${number} ${chaptersFor(bookId).find((candidate) => candidate.n === number)?.title || ''}`;
+              }).join(' · '),
+            }),
+          })),
+          // The former daily allocation no longer matches the edited weekly plan.
+          dailySchedule: undefined,
+          dailyGuidance: [],
+          aiPlanApplied: false,
+        }),
       };
     });
   }
@@ -1617,17 +1695,17 @@ export default function Home() {
       for (let pageNo = 1; pageNo <= Math.min(pdf.numPages, 24); pageNo += 1) {
         const page = await pdf.getPage(pageNo);
         const content = await page.getTextContent();
-        samples.push(content.items.map((item) => ('str' in item ? item.str : '')).join(' '));
+        samples.push(textContentLines(content.items).join('\n'));
       }
-      const found: Chapter[] = [];
+      const found = new Map<number, DetectedChapter>();
       samples.forEach((text, pageIndex) => {
         const matcher = /(?:chapter|chap\.?|ch\.?|第)\s*(\d{1,3}|[一二三四五六七八九十]{1,3})\s*(?:章)?\s*[:：.\-–]?\s*([^\n]{3,80})/gi;
         for (const match of text.matchAll(matcher)) {
           const chapter = chapterFromLine(match[0], pageIndex + 1, pdf.numPages);
-          if (chapter && !found.some((item) => item.n === chapter.n)) found.push(chapter);
+          if (chapter) rememberChapter(found, chapter);
         }
       });
-      const chapters = found.sort((a, b) => a.n - b.n);
+      const chapters = storedChapters(found);
       const textLayerReady = !!samples.join('').replace(/\s/g, '').length;
       const ocrRequired = !textLayerReady || chapters.length < 4;
       const data: { book: Book } = {
@@ -1672,7 +1750,7 @@ export default function Home() {
       const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
       const { createWorker } = await import('tesseract.js');
       const worker = await createWorker(['eng', 'chi_sim']);
-      const found: Chapter[] = [];
+      const found = new Map<number, DetectedChapter>();
       const startedAt = Date.now();
       setOcrProgress({ current: 0, total: pdf.numPages, startedAt });
       for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
@@ -1693,24 +1771,22 @@ export default function Home() {
         setOcrProgress({ current: pageNo, total: pdf.numPages, startedAt });
         for (const line of pageText.split('\n')) {
           const chapter = chapterFromLine(line, pageNo, pdf.numPages);
-          if (chapter && !found.some((item) => item.n === chapter.n)) {
-            found.push(chapter);
-          }
+          if (chapter) rememberChapter(found, chapter);
         }
       }
       await worker.terminate();
       setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrRequired: false, ocrTextReady: true } : book) }));
-      if (found.length < 4) {
+      if (found.size < 4) {
         setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrReady: false, ocrTextReady: true } : book) }));
         throw new Error('整书 OCR 已完成，但只识别到不足 4 个章节，不能据此生成可靠计划。建议换用带清晰目录页的 PDF。');
       }
-      const chapters = found.sort((a, b) => a.n - b.n);
+      const chapters = storedChapters(found);
       CHAPTERS[target.id] = chapters;
       setStore((s) => ({
         ...s,
         uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, chapters, ocrRequired: false, ocrTextReady: true, ocrReady: true } : book),
         studyPlans: s.studyPlans.map((plan) => plan.bookIds.includes(target.id)
-          ? { ...plan, schedule: buildSchedule(plan.bookIds, plan.weeks, plan.weekdayTime, plan.weekendTime) }
+          ? { ...plan, schedule: buildSchedule(plan.bookIds, plan.weeks, plan.weekdayTime, plan.weekendTime), dailySchedule: undefined, dailyGuidance: [], aiPlanApplied: false }
           : plan),
       }));
     } catch (ocrError) {
@@ -1732,21 +1808,21 @@ export default function Home() {
       const pdfjs = await import('pdfjs-dist');
       pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
       const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
-      const found: Chapter[] = [];
+      const found = new Map<number, DetectedChapter>();
       const startedAt = Date.now();
       setOcrProgress({ current: 0, total: pdf.numPages, startedAt });
       for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
         const pdfPage = await pdf.getPage(pageNo);
         const content = await pdfPage.getTextContent();
-        const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ');
+        const text = textContentLines(content.items).join('\n');
         const matcher = /(?:chapter|chap\.?|ch\.?|第)\s*(\d{1,3}|[一二三四五六七八九十]{1,3})\s*(?:章)?\s*[:：.\-–]?\s*([^\n]{3,100})/gi;
         for (const match of text.matchAll(matcher)) {
           const chapter = chapterFromLine(match[0], pageNo, pdf.numPages);
-          if (chapter && !found.some((item) => item.n === chapter.n)) found.push(chapter);
+          if (chapter) rememberChapter(found, chapter);
         }
         setOcrProgress({ current: pageNo, total: pdf.numPages, startedAt });
       }
-      const chapters = found.sort((a, b) => a.n - b.n);
+      const chapters = storedChapters(found);
       if (chapters.length < 4) {
         setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrRequired: true, ocrReady: false, textLayerReady: false } : book) }));
         throw new Error('这本书的文字层无法提供可靠目录。请使用“整书 OCR”识别后再生成学习计划。');
@@ -1756,7 +1832,7 @@ export default function Home() {
         ...s,
         uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, chapters, ocrRequired: false, ocrReady: true, textLayerReady: true } : book),
         studyPlans: s.studyPlans.map((plan) => plan.bookIds.includes(target.id)
-          ? { ...plan, schedule: buildSchedule(plan.bookIds, plan.weeks, plan.weekdayTime, plan.weekendTime) }
+          ? { ...plan, schedule: buildSchedule(plan.bookIds, plan.weeks, plan.weekdayTime, plan.weekendTime), dailySchedule: undefined, dailyGuidance: [], aiPlanApplied: false }
           : plan),
       }));
     } catch (indexError) {
@@ -1903,6 +1979,53 @@ export default function Home() {
     setLastSession(null);
     setView('reader');
   }
+  async function resolveChapterStartPage(target: Book, chapterNo: number) {
+    const saved = chaptersFor(target.id).find((chapter) => chapter.n === chapterNo);
+    if (!target.file.startsWith('local:')) return saved?.page || 1;
+    try {
+      const file = await loadLocalPdf(target.id);
+      if (!file) return saved?.page || 1;
+      const pdfjs = await import('pdfjs-dist');
+      pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+      const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+      for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
+        const pdfPage = await pdf.getPage(pageNo);
+        const content = await pdfPage.getTextContent();
+        let line = '';
+        const lines: string[] = [];
+        for (const item of content.items) {
+          if (!('str' in item)) continue;
+          line += `${line ? ' ' : ''}${item.str}`;
+          if ('hasEOL' in item && item.hasEOL) { lines.push(line); line = ''; }
+        }
+        if (line) lines.push(line);
+        if (!lines.some((value) => value.trim())) {
+          const ocr = await loadOcrPage(target.id, pageNo);
+          if (ocr) lines.push(ocr);
+        }
+        const pageText = lines.join('\n');
+        const headingCount = pageText.match(/(?:chapter|chap\.?|ch\.?|第)\s*(?:\d{1,3}|[一二三四五六七八九十]{1,3})/gi)?.length || 0;
+        if (headingCount > 2) continue; // contents/index page
+        const isHeading = lines.some((value) => {
+          const candidate = chapterFromLine(value, pageNo, pdf.numPages);
+          return candidate?.n === chapterNo && !candidate.tocLike;
+        });
+        if (!isHeading) continue;
+        if (saved?.page !== pageNo) {
+          const chapters = chaptersFor(target.id).map((chapter) => chapter.n === chapterNo ? { ...chapter, page: pageNo } : chapter);
+          CHAPTERS[target.id] = chapters;
+          setStore((current) => ({
+            ...current,
+            uploadedBooks: current.uploadedBooks.map((book) => book.id === target.id ? { ...book, chapters } : book),
+          }));
+        }
+        return pageNo;
+      }
+    } catch {
+      // Retain the saved mapping if the local file cannot be scanned right now.
+    }
+    return saved?.page || 1;
+  }
   function openPlanReader(plan: StudyPlan) {
     const scheduled =
       plan.schedule ||
@@ -1929,11 +2052,11 @@ export default function Home() {
     setSelectedChapterNo(chapterNo);
     openReader(target, resume, plan.id);
   }
-  function openPlanUnit(plan: StudyPlan, weekNo: number, unit: PlannedWeek['units'][number]) {
+  async function openPlanUnit(plan: StudyPlan, weekNo: number, unit: PlannedWeek['units'][number]) {
     const target = books.find((item) => item.id === unit.bookId);
     if (!target) return;
     const chapterNo = unit.chapterNos[0] || 1;
-    const start = chaptersFor(unit.bookId).find((chapter) => chapter.n === chapterNo)?.page || 1;
+    const start = await resolveChapterStartPage(target, chapterNo);
     setStore((s) => ({
       ...s,
       activePlanId: plan.id,
@@ -1952,7 +2075,7 @@ export default function Home() {
     const schedule = planStats(plan).schedule;
     const week = schedule.find((item) => item.units.some((unit) => unit.bookId === bookId && unit.chapterNos.includes(stats.nextChapter))) || schedule.find((item) => item.units.some((unit) => unit.bookId === bookId));
     const unit = week?.units.find((item) => item.bookId === bookId && item.chapterNos.includes(stats.nextChapter)) || week?.units.find((item) => item.bookId === bookId);
-    if (week && unit) openPlanUnit(plan, week.week, unit);
+    if (week && unit) void openPlanUnit(plan, week.week, unit);
   }
   function chooseWeek(value: number) {
     setSelectedWeek(value);
@@ -2543,7 +2666,7 @@ export default function Home() {
                 onOpenDay={(day) => {
                   const task = day.tasks[0];
                   if (!task) return;
-                  openPlanUnit(activePlan, day.week, { bookId: task.bookId, chapterNos: [task.start], summary: '' });
+                  void openPlanUnit(activePlan, day.week, { bookId: task.bookId, chapterNos: [task.start], summary: '' });
                 }}
               />
               <div className="mt-5 flex flex-wrap gap-2">
