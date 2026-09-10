@@ -850,14 +850,16 @@ export default function Home() {
   const [planPreview, setPlanPreview] = useState<StudyPlan | null>(null);
   const [planGenerating, setPlanGenerating] = useState(false);
   const [plannerListening, setPlannerListening] = useState(false);
-  const [importKind, setImportKind] = useState<'interview' | 'deal'>(
-    'interview',
-  );
-  const [importUrl, setImportUrl] = useState('');
-  const [importTitle, setImportTitle] = useState('');
-  const [importContent, setImportContent] = useState('');
-  const [importing, setImporting] = useState(false);
-  const [importError, setImportError] = useState('');
+  const [importDrafts, setImportDrafts] = useState<Record<'interview' | 'deal', {
+    url: string;
+    title: string;
+    content: string;
+    importing: boolean;
+    error: string;
+  }>>({
+    interview: { url: '', title: '', content: '', importing: false, error: '' },
+    deal: { url: '', title: '', content: '', importing: false, error: '' },
+  });
   const [uploadingBook, setUploadingBook] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const [ocrIndexingBookId, setOcrIndexingBookId] = useState<string | null>(null);
@@ -1735,16 +1737,23 @@ export default function Home() {
     });
   }
 
-  async function saveImportedItem() {
-    if (!importTitle.trim() && !importUrl.trim()) return;
-    const ai = aiFor(importKind === 'deal' ? 'investment-analysis' : 'import');
+  function updateImportDraft(kind: 'interview' | 'deal', patch: Partial<(typeof importDrafts)['interview']>) {
+    setImportDrafts((drafts) => ({ ...drafts, [kind]: { ...drafts[kind], ...patch } }));
+  }
+
+  async function saveImportedItem(kind: 'interview' | 'deal') {
+    const draft = importDrafts[kind];
+    if (!draft.url.trim() && !draft.content.trim()) {
+      updateImportDraft(kind, { error: '请粘贴一条公开文章链接。' });
+      return;
+    }
+    const ai = aiFor(kind === 'deal' ? 'investment-analysis' : 'import');
     const key = ai.apiKey;
     if (!key) {
       setView('settings');
       return;
     }
-    setImporting(true);
-    setImportError('');
+    updateImportDraft(kind, { importing: true, error: '' });
     try {
       const response = await fetch('/api/import', {
         method: 'POST',
@@ -1756,10 +1765,10 @@ export default function Home() {
           autoRoute: ai.autoRoute,
           thinking: ai.thinking,
           reasoningEffort: ai.reasoningEffort,
-          kind: importKind,
-          title: importTitle,
-          url: importUrl,
-          content: importContent,
+          kind,
+          title: draft.title,
+          url: draft.url,
+          content: draft.content,
         }),
       });
       const data = (await response.json()) as {
@@ -1770,22 +1779,20 @@ export default function Home() {
       if (!response.ok) throw new Error(data.error || '分析失败');
       const item: ImportedItem = {
         id: crypto.randomUUID(),
-        kind: importKind,
-        title: importTitle.trim() || '未命名资料',
-        sourceUrl: importUrl.trim(),
-        content: importContent.trim(),
+        kind,
+        title: draft.title.trim() || (kind === 'interview' ? '未命名面试资料' : '未命名投资资料'),
+        sourceUrl: draft.url.trim(),
+        content: draft.content.trim(),
         analysis: data.analysis || '',
         createdAt: new Date().toISOString(),
         archive: data.archive,
       };
       setStore((s) => ({ ...s, imports: [...s.imports, item] }));
-      setImportTitle('');
-      setImportUrl('');
-      setImportContent('');
+      updateImportDraft(kind, { title: '', url: '', content: '', error: '' });
     } catch (e) {
-      setImportError(e instanceof Error ? e.message : '分析失败');
+      updateImportDraft(kind, { error: e instanceof Error ? e.message : '分析失败' });
     } finally {
-      setImporting(false);
+      updateImportDraft(kind, { importing: false });
     }
   }
 
@@ -2708,19 +2715,13 @@ export default function Home() {
             active={view === 'review'}
             icon={<GraduationCap />}
             label={language === 'zh' ? '面试训练' : 'Interview'}
-            onClick={() => {
-              setImportKind('interview');
-              setView('review');
-            }}
+            onClick={() => setView('review')}
           />
           <Nav
             active={view === 'intel'}
             icon={<Newspaper />}
             label={language === 'zh' ? '投资雷达' : 'Deal Radar'}
-            onClick={() => {
-              setImportKind('deal');
-              setView('intel');
-            }}
+            onClick={() => setView('intel')}
           />
         </nav>
         <div className="flex items-center gap-2">
@@ -3494,62 +3495,15 @@ export default function Home() {
 
       {view === 'review' && (
         <PageShell
-          title={language === 'zh' ? '面试问题操练场' : 'Interview Practice'}
-          subtitle={language === 'zh' ? '以投行经典技术题的答题结构为骨架，再加入 PE 投资判断、交易语境和英文追问。' : 'Build technical answers with PE judgment, transaction context, and English follow-up questions.'}
+          title={language === 'zh' ? '面试经验库' : 'Interview Experience Library'}
+          subtitle={language === 'zh' ? '粘贴公开文章链接，自动提取公司、面试问题，以及可练习的中英文答题框架。' : 'Paste a public article link to extract companies, interview questions, and bilingual answer frameworks.'}
         >
-          <div className="grid gap-5 lg:grid-cols-2">
-            <div className="rounded-3xl bg-[var(--green)] p-7 text-white">
-              <p className="text-sm text-white/60">{language === 'zh' ? '训练方式' : 'Practice mode'}</p>
-              <h2 className="mt-2 text-2xl font-semibold">
-                {language === 'zh' ? '先回答，再获得评价' : 'Answer first. Then get feedback.'}
-              </h2>
-              <p className="mt-3 leading-7 text-white/75">
-                {language === 'zh' ? '系统从概念准确性、结构清晰度、投资判断、下行风险和英文表达五个维度评价；不会在你回答前展示标准答案。' : 'Your answer is assessed on conceptual accuracy, structure, investment judgment, downside risks, and English expression. The model answer stays hidden until you answer.'}
-              </p>
-              <button onClick={() => { setMockOpen(true); if (!mockQuestion) runTechnicalMock('generate'); }} className="mt-7 rounded-xl bg-[var(--gold)] px-4 py-2.5 font-semibold text-[#243c34]">
-                {language === 'zh' ? '开始技术题模拟' : 'Start technical mock'}
-              </button>
-            </div>
-            <div className="rounded-3xl border border-[var(--line)] bg-white p-7">
-              <h2 className="font-semibold">{language === 'zh' ? '训练素材' : 'Training material'}</h2>
-              <div className="mt-5 space-y-3">
-                <Stat label={language === 'zh' ? '已记录问题' : 'Saved questions'} value={store.questions.length} />
-                <Stat
-                  label={language === 'zh' ? '已完成学习日' : 'Completed study days'}
-                  value={store.logs.filter((l) => l.completed).length}
-                />
-                <Stat
-                  label={language === 'zh' ? '导入面试资料' : 'Imported interview material'}
-                  value={
-                    store.imports.filter((x) => x.kind === 'interview').length
-                  }
-                />
-              </div>
-            </div>
-          </div>
-          {mockOpen && (
-            <section className="mt-6 rounded-3xl border border-[var(--green)] bg-white p-6">
-              <div className="flex items-center justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-wider text-[var(--green)]">Technical mock · DeepSeek V4.1 Flash</p><h2 className="mt-1 text-xl font-semibold">{language === 'zh' ? '先作答，再看反馈' : 'Answer before feedback'}</h2></div><button onClick={() => setMockOpen(false)} className="rounded-xl border border-[var(--line)] p-2"><X className="size-4" /></button></div>
-              <div className="mt-5 rounded-2xl bg-[var(--soft)] p-4 whitespace-pre-wrap leading-7">{mockBusy && !mockQuestion ? (language === 'zh' ? '正在根据已归档面经出题…' : 'Preparing a question from your archive…') : mockQuestion}</div>
-              <textarea value={mockAnswer} onChange={(e) => setMockAnswer(e.target.value)} placeholder={language === 'zh' ? '在这里写下你的完整回答；提交后会自动归档到读书笔记。' : 'Write your answer here. Feedback will be automatically archived.'} className="mt-4 min-h-36 w-full rounded-2xl border border-[var(--line)] p-4 outline-none focus:border-[var(--green)]" />
-              <div className="mt-4 flex flex-wrap gap-3"><button disabled={mockBusy} onClick={() => runTechnicalMock('review')} className="rounded-xl bg-[var(--green)] px-4 py-2.5 font-semibold text-white disabled:opacity-50">{mockBusy ? (language === 'zh' ? '正在评价…' : 'Reviewing…') : (language === 'zh' ? '提交并获取评价' : 'Submit for feedback')}</button><button disabled={mockBusy} onClick={() => runTechnicalMock('generate')} className="rounded-xl border border-[var(--line)] px-4 py-2.5 font-medium">{language === 'zh' ? '换一道题' : 'New question'}</button></div>
-              {mockFeedback && <div className="mt-5 whitespace-pre-wrap rounded-2xl bg-[var(--green)] p-5 leading-7 text-white">{mockFeedback}</div>}
-            </section>
-          )}
-          <div className="mt-6">
+          <div>
             <ImportWorkbench
-              kind={importKind}
-              setKind={setImportKind}
-              url={importUrl}
-              setUrl={setImportUrl}
-              title={importTitle}
-              setTitle={setImportTitle}
-              content={importContent}
-              setContent={setImportContent}
-              onSave={saveImportedItem}
-              importing={importing}
-              error={importError}
-              lockedKind="interview"
+              draft={importDrafts.interview}
+              onChange={(patch) => updateImportDraft('interview', patch)}
+              onSave={() => saveImportedItem('interview')}
+              kind="interview"
               language={language}
             />
           </div>
@@ -4158,21 +4112,13 @@ export default function Home() {
       {view === 'intel' && (
         <PageShell
           title={language === 'zh' ? '投资雷达' : 'Deal Radar'}
-          subtitle={language === 'zh' ? '把公众号文章、交易新闻和行业资料转成可复用的一级市场判断框架。' : 'Turn deal news and industry material into reusable private-market judgment.'}
+          subtitle={language === 'zh' ? '粘贴公开文章链接，自动整理公司、行业、产业链、规模、技术与关键事实。' : 'Paste a public article link to summarize companies, industries, supply chain, scale, technology, and key facts.'}
         >
           <ImportWorkbench
-            kind={importKind}
-            setKind={setImportKind}
-            url={importUrl}
-            setUrl={setImportUrl}
-            title={importTitle}
-            setTitle={setImportTitle}
-            content={importContent}
-            setContent={setImportContent}
-            onSave={saveImportedItem}
-            importing={importing}
-            error={importError}
-            lockedKind="deal"
+            draft={importDrafts.deal}
+            onChange={(patch) => updateImportDraft('deal', patch)}
+            onSave={() => saveImportedItem('deal')}
+            kind="deal"
             language={language}
           />
           <ImportArchive items={store.imports.filter((item) => item.kind === 'deal')} kind="deal" language={language} />
@@ -4568,81 +4514,64 @@ function ImportArchive({ items, kind, language }: { items: ImportedItem[]; kind:
 }
 
 function ImportWorkbench({
-  kind,
-  setKind,
-  url,
-  setUrl,
-  title,
-  setTitle,
-  content,
-  setContent,
+  draft,
+  onChange,
   onSave,
-  importing,
-  error,
-  lockedKind,
+  kind,
   language = 'zh',
 }: {
-  kind: 'interview' | 'deal';
-  setKind: (v: 'interview' | 'deal') => void;
-  url: string;
-  setUrl: (v: string) => void;
-  title: string;
-  setTitle: (v: string) => void;
-  content: string;
-  setContent: (v: string) => void;
+  draft: { url: string; title: string; content: string; importing: boolean; error: string };
+  onChange: (patch: Partial<{ url: string; title: string; content: string }>) => void;
   onSave: () => void;
-  importing: boolean;
-  error: string;
-  lockedKind: 'interview' | 'deal';
+  kind: 'interview' | 'deal';
   language?: 'zh' | 'en';
 }) {
+  const isInterview = kind === 'interview';
   return (
     <section className="rounded-3xl border border-[var(--line)] bg-white p-6">
       <div className="mb-4">
         <p className="text-sm font-semibold text-[var(--brown)]">
-          {lockedKind === 'interview' ? (language === 'zh' ? '面试资料导入' : 'Interview material') : (language === 'zh' ? '交易资料导入' : 'Deal material')}
+          {isInterview ? (language === 'zh' ? '面试资料导入' : 'Interview material') : (language === 'zh' ? '投资资料导入' : 'Investment material')}
         </p>
         <h2 className="mt-1 text-lg font-semibold">
-          {lockedKind === 'interview'
-            ? (language === 'zh' ? '把经验文章变成你的答题训练' : 'Turn an article into answer practice')
-            : (language === 'zh' ? '把新闻变成你的投资视角' : 'Turn news into investment perspective')}
+          {isInterview
+            ? (language === 'zh' ? '把经验文章变成中英文面经框架' : 'Turn an article into bilingual interview frameworks')
+            : (language === 'zh' ? '把新闻变成简明投资摘要' : 'Turn news into a concise investment summary')}
         </h2>
       </div>
       <div className="mt-5 grid gap-3 md:grid-cols-2">
         <input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder={language === 'zh' ? '资料标题' : 'Title'}
+          value={draft.title}
+          onChange={(e) => onChange({ title: e.target.value })}
+          placeholder={language === 'zh' ? '资料标题（选填）' : 'Title (optional)'}
           className="h-11 rounded-xl border border-[var(--line)] px-3"
         />
         <input
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
+          value={draft.url}
+          onChange={(e) => onChange({ url: e.target.value })}
           placeholder={language === 'zh' ? '粘贴公众号或网页链接' : 'Paste a web link'}
           className="h-11 rounded-xl border border-[var(--line)] px-3"
         />
       </div>
-      <textarea
-        value={content}
-        onChange={(e) => setContent(e.target.value)}
-        placeholder={language === 'zh' ? '若微信链接无法自动读取，把正文复制到这里。交易资料会按交易概况、各方地位、估值、投资逻辑、技术亮点、风险与发展前景拆解。' : 'If a WeChat link cannot be read automatically, paste the text here. It will be broken down by deal overview, parties, valuation, thesis, technology, risks, and outlook.'}
-        className="mt-3 min-h-32 w-full rounded-xl border border-[var(--line)] p-3 leading-6"
-      />
       <div className="mt-3 flex items-center justify-between gap-4">
         <p className="text-xs leading-5 text-[var(--muted)]">
-          {language === 'zh' ? '系统会优先尝试链接；微信限制访问时使用你粘贴的正文。' : 'The system tries the link first; paste the article when WeChat blocks access.'}
+          {language === 'zh' ? '系统会自动读取公开网页，并在导入完成时立即归类保存。不要粘贴私密链接。' : 'The system reads public webpages automatically and files the result immediately. Do not use private links.'}
         </p>
         <button
           onClick={onSave}
-          disabled={importing}
+          disabled={draft.importing}
           className="shrink-0 rounded-xl bg-[var(--green)] px-4 py-2.5 font-semibold text-white"
         >
-          {importing ? (language === 'zh' ? '正在读取并分析…' : 'Reading and analysing…') : (language === 'zh' ? '导入并生成分析' : 'Import and analyse')}
+          {draft.importing ? (language === 'zh' ? '正在读取并分析…' : 'Reading and analysing…') : (language === 'zh' ? '导入并生成分析' : 'Import and analyse')}
         </button>
       </div>
-      {error && (
+      <details className="mt-3 text-xs text-[var(--muted)]">
+        <summary className="cursor-pointer">{language === 'zh' ? '链接无法读取？可手动粘贴正文作为备用' : 'Link unavailable? Paste text as a fallback'}</summary>
+        <textarea value={draft.content} onChange={(e) => onChange({ content: e.target.value })} placeholder={language === 'zh' ? '仅当公开链接受限时使用。' : 'Use only when a public link is blocked.'} className="mt-2 min-h-28 w-full rounded-xl border border-[var(--line)] p-3 text-sm leading-6" />
+      </details>
+      {draft.error && (
         <p className="mt-3 rounded-xl bg-[var(--gold-soft)] p-3 text-sm text-[var(--ink)]">
-          {error}
+          {draft.error}
         </p>
       )}
     </section>
