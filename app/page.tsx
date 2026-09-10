@@ -637,6 +637,23 @@ async function loadOcrPage(bookId: string, page: number): Promise<string | undef
   });
   db.close(); return text;
 }
+async function clearOcrPages(bookId: string) {
+  const db = await bookDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('ocrPages', 'readwrite');
+    const store = tx.objectStore('ocrPages');
+    const request = store.openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      if (String(cursor.key).startsWith(`${bookId}:`)) cursor.delete();
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  db.close();
+}
 async function ocrPageCount(bookId: string): Promise<number> {
   const db = await bookDatabase();
   const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
@@ -1791,7 +1808,7 @@ export default function Home() {
       setUploadingBook(false);
     }
   }
-  async function ocrBookContents(target: Book) {
+  async function ocrBookContents(target: Book, restart = false) {
     if (!target.file.startsWith('local:')) return;
     setOcrIndexingBookId(target.id);
     setIndexingMode('ocr');
@@ -1799,6 +1816,9 @@ export default function Home() {
     try {
       const file = await loadLocalPdf(target.id);
       if (!file) throw new Error('找不到本机文件，请重新上传。');
+      // Earlier OCR runs stored flattened lines. A deliberate retry starts from
+      // the PDF again, preserving heading layout for chapter detection.
+      if (restart) await clearOcrPages(target.id);
       const pdfjs = await import('pdfjs-dist');
       pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
       const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
@@ -1820,7 +1840,7 @@ export default function Home() {
           await pdfPage.render({ canvas, canvasContext: context, viewport }).promise;
           const result = await worker.recognize(canvas);
           pageText = result.data.text;
-          await saveOcrPage(target.id, pageNo, pageText.replace(/\s+/g, ' ').trim());
+          await saveOcrPage(target.id, pageNo, pageText.trim());
         }
         setOcrProgress({ current: pageNo, total: pdf.numPages, startedAt });
         for (const line of pageText.split('\n')) {
@@ -3017,6 +3037,15 @@ export default function Home() {
                         className="rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
                       >
                         {ocrIndexingBookId === b.id ? (language === 'zh' ? `整书 OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '一键 OCR 整本书' : 'OCR entire book')}
+                      </button>
+                    )}
+                    {b.file.startsWith('local:') && b.ocrTextReady && !b.ocrReady && (
+                      <button
+                        onClick={() => ocrBookContents(b, true)}
+                        disabled={ocrIndexingBookId === b.id}
+                        className="rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
+                      >
+                        {ocrIndexingBookId === b.id ? (language === 'zh' ? `重新 OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `Restarting OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '重新 OCR 整本书' : 'Restart full-book OCR')}
                       </button>
                     )}
                     {b.file.startsWith('local:') && b.ocrTextReady && hasReliableChapterSequence(b.id) && (
