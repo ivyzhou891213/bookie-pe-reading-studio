@@ -3031,11 +3031,11 @@ export default function Home() {
                 {books.map((b) => (
                   <div
                     key={b.id}
-                    className="flex w-full items-center gap-4 rounded-2xl bg-[var(--soft)] p-4 text-left"
+                    className="flex w-full flex-wrap items-center gap-4 rounded-2xl bg-[var(--soft)] p-4 text-left"
                   >
                     <button
                       onClick={() => openReader(b)}
-                      className="flex min-w-0 flex-1 items-center gap-4 text-left"
+                      className="flex w-full min-w-0 items-center gap-4 text-left lg:min-w-[28rem] lg:flex-1"
                     >
                       <img
                         src={b.cover}
@@ -3077,12 +3077,12 @@ export default function Home() {
                     </button>
                     <button
                       onClick={() => togglePlanBook(b.id)}
-                      className={`rounded-lg px-2.5 py-2 text-xs font-semibold ${planBooks.includes(b.id) ? 'bg-[var(--gold)] text-[var(--ink)]' : 'bg-white text-[var(--muted)]'}`}
+                      className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-2 text-xs font-semibold ${planBooks.includes(b.id) ? 'bg-[var(--gold)] text-[var(--ink)]' : 'bg-white text-[var(--muted)]'}`}
                       title="加入或移出本次计划购物车"
                     >
                       {planBooks.includes(b.id) ? (language === 'zh' ? '已选入计划' : 'In this plan') : (language === 'zh' ? '加入计划' : 'Add to plan')}
                     </button>
-                    {b.file.startsWith('local:') && <div className="flex flex-col gap-1 text-[10px]">
+                    {b.file.startsWith('local:') && <div className="shrink-0 flex flex-col gap-1 text-[10px]">
                       <span className="text-[var(--muted)]">规划方式</span>
                       <div className="flex gap-1">
                         <button onClick={() => setBookPlanningMode(b, 'chapters')} className={`rounded-md px-2 py-1 font-semibold ${(b.planningMode || inferPlanningMode(b)) === 'chapters' ? 'bg-[var(--green)] text-white' : 'bg-white text-[var(--muted)]'}`}>章节</button>
@@ -3094,7 +3094,7 @@ export default function Home() {
                       <button
                         onClick={() => rebuildBookContents(b)}
                         disabled={ocrIndexingBookId === b.id}
-                        className="rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
+                        className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
                       >
                         {ocrIndexingBookId === b.id ? (language === 'zh' ? `重建目录 ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `Contents ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '重建目录' : 'Rebuild contents')}
                       </button>
@@ -3103,7 +3103,7 @@ export default function Home() {
                       <button
                         onClick={() => ocrBookContents(b)}
                         disabled={ocrIndexingBookId === b.id}
-                        className="rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
+                        className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
                       >
                         {ocrIndexingBookId === b.id ? (language === 'zh' ? `整书 OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '一键 OCR 整本书' : 'OCR entire book')}
                       </button>
@@ -3112,7 +3112,7 @@ export default function Home() {
                       <button
                         onClick={() => ocrBookContents(b, true)}
                         disabled={ocrIndexingBookId === b.id}
-                        className="rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
+                        className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
                       >
                         {ocrIndexingBookId === b.id ? (language === 'zh' ? `重新 OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `Restarting OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '重新 OCR 整本书' : 'Restart full-book OCR')}
                       </button>
