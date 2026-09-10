@@ -3028,7 +3028,13 @@ export default function Home() {
                 </p>
               )}
               <div className="space-y-3">
-                {books.map((b) => (
+                {books.map((b) => {
+                  const sourceChapters = b.originalChapters || b.chapters || [];
+                  const chapterReliable = isReliableChapterList(sourceChapters);
+                  const planningMode = b.planningMode || inferPlanningMode(b);
+                  const needsInitialOcr = b.file.startsWith('local:') && !chapterReliable && !b.ocrTextReady && b.textLayerReady === false;
+                  const canChooseLightweightMode = b.file.startsWith('local:') && !chapterReliable && !needsInitialOcr && b.pages <= 100;
+                  return (
                   <div
                     key={b.id}
                     className="flex w-full flex-wrap items-center gap-4 rounded-2xl bg-[var(--soft)] p-4 text-left"
@@ -3048,19 +3054,19 @@ export default function Home() {
                         <span className="mt-1 block text-sm text-[var(--muted)]">
                           {language === 'zh' ? `当前第 ${store.progress[b.id] || 1} 页 · 共 ${b.pages} 页` : `Page ${store.progress[b.id] || 1} of ${b.pages}`}
                         </span>
-                        {b.file.startsWith('local:') && !hasReliableChapterSequence(b.id) && !b.ocrTextReady && (
+                        {b.file.startsWith('local:') && !chapterReliable && !b.ocrTextReady && (
                           <span className="mt-1 block text-xs font-medium text-[var(--brown)]">
                             {language === 'zh' ? `目录待修复：目前识别到 ${chaptersFor(b.id).length} 个章节，但有跳号或未验证页码。请先重建目录；若文字层不足，再进行整书 OCR。` : `Contents need review: ${chaptersFor(b.id).length} chapters were detected, but their sequence or pages are unverified. Rebuild the contents first; use full-book OCR only if its text layer is insufficient.`}
                           </span>
                         )}
-                        {b.file.startsWith('local:') && hasReliableChapterSequence(b.id) && (
+                        {b.file.startsWith('local:') && chapterReliable && (
                           <span className="mt-1 block text-xs font-medium text-[var(--green)]">
                             {language === 'zh' ? `目录已识别 · ${chaptersFor(b.id).length} 个章节` : `Contents identified · ${chaptersFor(b.id).length} chapters`}
                           </span>
                         )}
-                        {b.file.startsWith('local:') && b.ocrTextReady && !b.ocrReady && (
+                        {b.file.startsWith('local:') && b.ocrTextReady && !chapterReliable && (
                           <span className="mt-1 block text-xs font-medium text-[var(--green)]">
-                            {language === 'zh' ? '整书 OCR 已完成，但目录仍有跳号。可切换为“页码”或“一天读完”后继续生成计划。' : 'Full-book OCR is complete, but the contents still have gaps. Switch to Pages or One-day reading to keep planning.'}
+                            {b.pages > 100 ? (language === 'zh' ? '目录无法可靠识别，已自动改为按页码规划。' : 'Contents could not be verified, so this file is planned by pages.') : (language === 'zh' ? '目录无法可靠识别；可按页码规划，或将这份短资料安排在一天读完。' : 'Contents could not be verified. Plan by pages or finish this short document in one day.')}
                           </span>
                         )}
                         <span className="mt-2 block h-1.5 overflow-hidden rounded-full bg-white">
@@ -3075,63 +3081,47 @@ export default function Home() {
                       </span>
                       <ChevronRight className="size-4 text-[var(--muted)]" />
                     </button>
+                    <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:justify-end">
                     <button
                       onClick={() => togglePlanBook(b.id)}
-                      className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-2 text-xs font-semibold ${planBooks.includes(b.id) ? 'bg-[var(--gold)] text-[var(--ink)]' : 'bg-white text-[var(--muted)]'}`}
+                      className={`h-10 shrink-0 whitespace-nowrap rounded-xl px-3 text-sm font-semibold ${planBooks.includes(b.id) ? 'bg-[var(--gold)] text-[var(--ink)]' : 'bg-white text-[var(--muted)]'}`}
                       title="加入或移出本次计划购物车"
                     >
                       {planBooks.includes(b.id) ? (language === 'zh' ? '已选入计划' : 'In this plan') : (language === 'zh' ? '加入计划' : 'Add to plan')}
                     </button>
-                    {b.file.startsWith('local:') && <div className="shrink-0 flex flex-col gap-1 text-[10px]">
-                      <span className="text-[var(--muted)]">规划方式</span>
-                      <div className="flex gap-1">
-                        <button onClick={() => setBookPlanningMode(b, 'chapters')} className={`rounded-md px-2 py-1 font-semibold ${(b.planningMode || inferPlanningMode(b)) === 'chapters' ? 'bg-[var(--green)] text-white' : 'bg-white text-[var(--muted)]'}`}>章节</button>
-                        <button onClick={() => setBookPlanningMode(b, 'pages')} className={`rounded-md px-2 py-1 font-semibold ${(b.planningMode || inferPlanningMode(b)) === 'pages' ? 'bg-[var(--green)] text-white' : 'bg-white text-[var(--muted)]'}`}>页码</button>
-                        <button onClick={() => setBookPlanningMode(b, 'one-day')} className={`rounded-md px-2 py-1 font-semibold ${(b.planningMode || inferPlanningMode(b)) === 'one-day' ? 'bg-[var(--green)] text-white' : 'bg-white text-[var(--muted)]'}`}>一天读完</button>
-                      </div>
+                    {canChooseLightweightMode && <div className="flex h-10 overflow-hidden rounded-xl border border-[var(--line)] bg-white p-1">
+                      <button onClick={() => setBookPlanningMode(b, 'pages')} className={`rounded-lg px-3 text-sm font-semibold ${planningMode === 'pages' ? 'bg-[var(--green)] text-white' : 'text-[var(--muted)]'}`}>按页码</button>
+                      <button onClick={() => setBookPlanningMode(b, 'one-day')} className={`rounded-lg px-3 text-sm font-semibold ${planningMode === 'one-day' ? 'bg-[var(--green)] text-white' : 'text-[var(--muted)]'}`}>一天读完</button>
                     </div>}
-                    {b.file.startsWith('local:') && !hasReliableChapterSequence(b.id) && !b.ocrTextReady && b.textLayerReady !== false && (
+                    {b.file.startsWith('local:') && !chapterReliable && !b.ocrTextReady && b.textLayerReady !== false && (
                       <button
                         onClick={() => rebuildBookContents(b)}
                         disabled={ocrIndexingBookId === b.id}
-                        className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
+                        className="h-10 shrink-0 whitespace-nowrap rounded-xl border border-[var(--green)] px-3 text-sm font-semibold text-[var(--green)] disabled:opacity-50"
                       >
                         {ocrIndexingBookId === b.id ? (language === 'zh' ? `重建目录 ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `Contents ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '重建目录' : 'Rebuild contents')}
                       </button>
                     )}
-                    {b.file.startsWith('local:') && !hasReliableChapterSequence(b.id) && !b.ocrTextReady && b.textLayerReady === false && (
+                    {needsInitialOcr && (
                       <button
                         onClick={() => ocrBookContents(b)}
                         disabled={ocrIndexingBookId === b.id}
-                        className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
+                        className="h-10 shrink-0 whitespace-nowrap rounded-xl border border-[var(--green)] px-3 text-sm font-semibold text-[var(--green)] disabled:opacity-50"
                       >
                         {ocrIndexingBookId === b.id ? (language === 'zh' ? `整书 OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '一键 OCR 整本书' : 'OCR entire book')}
                       </button>
-                    )}
-                    {b.file.startsWith('local:') && b.ocrTextReady && !b.ocrReady && (
-                      <button
-                        onClick={() => ocrBookContents(b, true)}
-                        disabled={ocrIndexingBookId === b.id}
-                        className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--green)] px-2.5 py-2 text-xs font-semibold text-[var(--green)] disabled:opacity-50"
-                      >
-                        {ocrIndexingBookId === b.id ? (language === 'zh' ? `重新 OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `Restarting OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '重新 OCR 整本书' : 'Restart full-book OCR')}
-                      </button>
-                    )}
-                    {b.file.startsWith('local:') && b.ocrTextReady && hasReliableChapterSequence(b.id) && (
-                      <span className="rounded-lg border border-[var(--green)] bg-white px-2.5 py-2 text-xs font-semibold text-[var(--green)]">
-                        {language === 'zh' ? '已完成 OCR' : 'OCR complete'}
-                      </span>
                     )}
                     <button
                       aria-label={`从书架移除 ${b.title}`}
                       title="从书架移除（保留笔记）"
                       onClick={() => archiveBook(b.id)}
-                      className="rounded-lg p-2 text-[var(--muted)] hover:bg-white hover:text-[var(--ink)]"
+                      className="grid size-10 shrink-0 place-items-center rounded-xl text-[var(--muted)] hover:bg-white hover:text-[var(--ink)]"
                     >
                       <Trash2 className="size-4" />
                     </button>
+                    </div>
                   </div>
-                ))}
+                )})}
               </div>
             </div>
             <div className="flex min-h-[260px] flex-col items-center justify-center rounded-3xl border border-[var(--line)] bg-[var(--gold-soft)] p-7 text-center">
