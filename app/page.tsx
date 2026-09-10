@@ -44,6 +44,8 @@ type Book = {
   ocrReady?: boolean;
   ocrTextReady?: boolean;
   textLayerReady?: boolean;
+  planningMode?: 'chapters' | 'pages' | 'one-day';
+  originalChapters?: Chapter[];
 };
 type QA = {
   id: string;
@@ -375,6 +377,34 @@ function isReliableChapterList(chapters: Chapter[]) {
 }
 function hasReliableChapterSequence(bookId: string) {
   return isReliableChapterList(chaptersFor(bookId));
+}
+function inferPlanningMode(book: Book): NonNullable<Book['planningMode']> {
+  if (isReliableChapterList(book.chapters || [])) return 'chapters';
+  return /presentation|investor|deck|slides|研报|研究报告|report/i.test(book.title) ? 'one-day' : 'pages';
+}
+function planningUnits(book: Book, mode = book.planningMode || inferPlanningMode(book)): Chapter[] {
+  if (mode === 'one-day') return [{ n: 1, title: '完整阅读（建议当天完成）', page: 1 }];
+  if (mode === 'pages') {
+    const parts = Math.min(14, Math.max(1, Math.ceil(book.pages / 40)));
+    return Array.from({ length: parts }, (_, index) => {
+      const start = Math.floor((index * book.pages) / parts) + 1;
+      const end = Math.floor(((index + 1) * book.pages) / parts);
+      return { n: index + 1, title: `第 ${start}–${end} 页`, page: start };
+    });
+  }
+  return book.originalChapters || book.chapters || [];
+}
+function taskLabel(task: PlannedDay['tasks'][number], books: Book[]) {
+  const book = books.find((item) => item.id === task.bookId);
+  const mode = book?.planningMode || (book ? inferPlanningMode(book) : 'chapters');
+  if (mode === 'one-day') return `${scheduleBookLabel(book)} · 完整阅读`;
+  if (mode === 'pages') {
+    const units = chaptersFor(task.bookId);
+    const start = units.find((item) => item.n === task.start)?.page || 1;
+    const end = task.end >= units.length ? (book?.pages || units.at(-1)?.page || start) : (units.find((item) => item.n === task.end + 1)?.page || start + 1) - 1;
+    return `${scheduleBookLabel(book)} · p.${start}–${end}`;
+  }
+  return `${scheduleBookLabel(book)} · Ch.${task.start}${task.end !== task.start ? `–Ch.${task.end}` : ''}${task.part ? `（第 ${task.part} 段）` : ''}`;
 }
 function isUsableChapter(title: string) {
   const clean = title.replace(/\s+/g, ' ').trim();
@@ -850,6 +880,10 @@ export default function Home() {
           ? {
               ...item,
               title: cleanUploadedBookTitle(item.title),
+              ...(item.planningMode ? {} : (() => {
+                const mode = inferPlanningMode(item);
+                return mode === 'chapters' ? { planningMode: mode } : { planningMode: mode, originalChapters: item.chapters, chapters: planningUnits({ ...item, planningMode: mode }) };
+              })()),
               // Two headings are not a reliable table of contents for a full book.
               ...(item.chapters && item.chapters.length < 4 && !item.ocrTextReady
                 ? { ocrRequired: true, ocrReady: false }
@@ -1328,7 +1362,7 @@ export default function Home() {
     return contexts;
   }
   async function extractPlanFromBrief() {
-    const incompleteBook = planBooks.map((id) => books.find((book) => book.id === id)).find((book) => book?.file.startsWith('local:') && !hasReliableChapterSequence(book.id));
+    const incompleteBook = planBooks.map((id) => books.find((book) => book.id === id)).find((book) => book?.file.startsWith('local:') && (book.planningMode || inferPlanningMode(book)) === 'chapters' && !hasReliableChapterSequence(book.id));
     if (incompleteBook) {
       setPlanError(language === 'zh' ? `「${incompleteBook.title}」的目录不连续或未验证（例如跳号章节），不能生成可靠计划。请先在书架点击“重建目录”；若文字层不足，页面会提示你再做整书 OCR。` : `“${incompleteBook.title}” has an incomplete or unverified chapter directory, so a reliable plan cannot be generated. Rebuild its contents from the shelf first; use full-book OCR only if its text layer is insufficient.`);
       return;
@@ -1778,7 +1812,8 @@ export default function Home() {
       });
       const chapters = storedChapters(found);
       const textLayerReady = !!samples.join('').replace(/\s/g, '').length;
-      const ocrRequired = !textLayerReady || chapters.length < 4;
+      const mode = isReliableChapterList(chapters) ? 'chapters' : inferPlanningMode({ id, title: cleanUploadedBookTitle(file.name), short: 'MY', file: `local:${id}`, cover, pages: pdf.numPages, color: '#8ca8bd', chapters });
+      const ocrRequired = mode === 'chapters' ? !textLayerReady || chapters.length < 4 : false;
       const data: { book: Book } = {
         book: {
           id,
@@ -1788,7 +1823,9 @@ export default function Home() {
           cover,
           pages: pdf.numPages,
           color: '#8ca8bd',
-          chapters: chapters.length ? chapters : [{ n: 1, title: ocrRequired ? '等待 OCR 识别目录' : '完整阅读', page: 1 }],
+          chapters: mode === 'chapters' ? (chapters.length ? chapters : [{ n: 1, title: '等待 OCR 识别目录', page: 1 }]) : planningUnits({ id, title: cleanUploadedBookTitle(file.name), short: 'MY', file: `local:${id}`, cover, pages: pdf.numPages, color: '#8ca8bd', chapters, planningMode: mode }),
+          originalChapters: chapters,
+          planningMode: mode,
           ocrRequired,
           ocrReady: !ocrRequired,
           textLayerReady,
@@ -1807,6 +1844,29 @@ export default function Home() {
     } finally {
       setUploadingBook(false);
     }
+  }
+  function setBookPlanningMode(target: Book, mode: NonNullable<Book['planningMode']>) {
+    const originalChapters = target.originalChapters || target.chapters || [];
+    const replacement: Book = {
+      ...target,
+      originalChapters,
+      planningMode: mode,
+      chapters: planningUnits({ ...target, originalChapters, planningMode: mode }),
+      ocrRequired: mode === 'chapters' ? target.ocrRequired : false,
+    };
+    CHAPTERS[target.id] = replacement.chapters || [];
+    setStore((s) => ({
+      ...s,
+      uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? replacement : book),
+      studyPlans: s.studyPlans.map((plan) => plan.bookIds.includes(target.id) ? {
+        ...plan,
+        schedule: buildSchedule(plan.bookIds, plan.weeks, plan.weekdayTime, plan.weekendTime),
+        dailySchedule: undefined,
+        dailyGuidance: [],
+        aiPlanApplied: false,
+        scheduleVersion: undefined,
+      } : plan),
+    }));
   }
   async function ocrBookContents(target: Book, restart = false) {
     if (!target.file.startsWith('local:')) return;
@@ -2055,6 +2115,7 @@ export default function Home() {
   }
   async function resolveChapterStartPage(target: Book, chapterNo: number): Promise<number | null> {
     const saved = chaptersFor(target.id).find((chapter) => chapter.n === chapterNo);
+    if ((target.planningMode || inferPlanningMode(target)) !== 'chapters') return saved?.page || 1;
     if (!target.file.startsWith('local:')) return saved?.page || 1;
     try {
       const file = await loadLocalPdf(target.id);
@@ -2999,7 +3060,7 @@ export default function Home() {
                         )}
                         {b.file.startsWith('local:') && b.ocrTextReady && !b.ocrReady && (
                           <span className="mt-1 block text-xs font-medium text-[var(--green)]">
-                            {language === 'zh' ? '整书 OCR 已完成，但目录仍有跳号或不足 4 章，不能据此生成可靠计划。' : 'Full-book OCR is complete, but the contents still have gaps or fewer than four chapters; a reliable plan cannot be generated from it.'}
+                            {language === 'zh' ? '整书 OCR 已完成，但目录仍有跳号。可切换为“页码”或“一天读完”后继续生成计划。' : 'Full-book OCR is complete, but the contents still have gaps. Switch to Pages or One-day reading to keep planning.'}
                           </span>
                         )}
                         <span className="mt-2 block h-1.5 overflow-hidden rounded-full bg-white">
@@ -3021,6 +3082,14 @@ export default function Home() {
                     >
                       {planBooks.includes(b.id) ? (language === 'zh' ? '已选入计划' : 'In this plan') : (language === 'zh' ? '加入计划' : 'Add to plan')}
                     </button>
+                    {b.file.startsWith('local:') && <div className="flex flex-col gap-1 text-[10px]">
+                      <span className="text-[var(--muted)]">规划方式</span>
+                      <div className="flex gap-1">
+                        <button onClick={() => setBookPlanningMode(b, 'chapters')} className={`rounded-md px-2 py-1 font-semibold ${(b.planningMode || inferPlanningMode(b)) === 'chapters' ? 'bg-[var(--green)] text-white' : 'bg-white text-[var(--muted)]'}`}>章节</button>
+                        <button onClick={() => setBookPlanningMode(b, 'pages')} className={`rounded-md px-2 py-1 font-semibold ${(b.planningMode || inferPlanningMode(b)) === 'pages' ? 'bg-[var(--green)] text-white' : 'bg-white text-[var(--muted)]'}`}>页码</button>
+                        <button onClick={() => setBookPlanningMode(b, 'one-day')} className={`rounded-md px-2 py-1 font-semibold ${(b.planningMode || inferPlanningMode(b)) === 'one-day' ? 'bg-[var(--green)] text-white' : 'bg-white text-[var(--muted)]'}`}>一天读完</button>
+                      </div>
+                    </div>}
                     {b.file.startsWith('local:') && !hasReliableChapterSequence(b.id) && !b.ocrTextReady && b.textLayerReady !== false && (
                       <button
                         onClick={() => rebuildBookContents(b)}
@@ -4247,8 +4316,7 @@ function DailyStudyCalendar({ plan, books, onOpenDay }: { plan: StudyPlan; books
               {day.tasks.length ? <>
                 <p className="mt-2 text-xs font-semibold leading-5 text-[var(--ink)]">
                   {day.tasks.map((task) => {
-                    const book = books.find((item) => item.id === task.bookId);
-                    return `${scheduleBookLabel(book)} · Ch.${task.start}${task.end !== task.start ? `–Ch.${task.end}` : ''}${task.part ? `（第 ${task.part} 段）` : ''}`;
+                    return taskLabel(task, books);
                   }).join('；')}
                 </p>
                 {(day.outcome || guidance?.outcome) && <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{day.outcome || guidance?.outcome}</p>}
@@ -4344,7 +4412,8 @@ function PlannerModal({
         <div className="mt-6 grid gap-4 sm:grid-cols-2">
           {books.map((book) => {
             const active = selected.includes(book.id);
-            const directoryReady = !book.file.startsWith('local:') || hasReliableChapterSequence(book.id);
+            const mode = book.planningMode || inferPlanningMode(book);
+            const directoryReady = !book.file.startsWith('local:') || mode !== 'chapters' || hasReliableChapterSequence(book.id);
             return (
               <button
                 key={book.id}
@@ -4359,7 +4428,7 @@ function PlannerModal({
                 <span>
                   <b>{book.title}</b>
                   <span className="mt-2 block text-sm text-[var(--muted)]">
-                    {chaptersFor(book.id).length} 个章节
+                    {(book.planningMode || inferPlanningMode(book)) === 'pages' ? `${book.pages} 页 · 按页码规划` : (book.planningMode || inferPlanningMode(book)) === 'one-day' ? '一天读完' : `${chaptersFor(book.id).length} 个章节`}
                   </span>
                   <span className="mt-3 block text-sm font-semibold text-[var(--brown)]">
                     {active ? '✓ 已加入计划' : '加入计划'}
@@ -4372,7 +4441,7 @@ function PlannerModal({
         </div>
         {selected.some((bookId) => {
           const book = books.find((item) => item.id === bookId);
-          return Boolean(book?.file.startsWith('local:')) && !hasReliableChapterSequence(bookId);
+          return Boolean(book?.file.startsWith('local:')) && (book.planningMode || inferPlanningMode(book)) === 'chapters' && !hasReliableChapterSequence(bookId);
         }) && <p role="alert" className="mt-4 rounded-xl bg-[#fff5f4] px-3 py-2 text-sm leading-6 text-[#b42318]">已选书中有低清晰度或跳号目录。你仍可按页阅读；要生成能跳转正文的每日计划，请先关闭此窗口，并在书架对该书点击“重新 OCR 整本书”。</p>}
         <section className="planner-chat mt-6 rounded-[28px] p-5">
           <div className="flex items-center justify-between">
