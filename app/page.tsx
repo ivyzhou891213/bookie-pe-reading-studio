@@ -109,6 +109,10 @@ type StudyPlan = {
   dailySchedule?: PlannedDay[];
   dailyGuidance?: Array<{ week: number; day: number; focus?: string; outcome?: string }>;
   aiPlanApplied?: boolean;
+  // Bump this whenever the derived daily allocation changes. Plans are stored
+  // locally, so this repairs old previews without touching user content.
+  scheduleVersion?: number;
+  scheduleNeedsContentsRepair?: boolean;
   adjustedWeeks?: Record<number, boolean>;
   conversation?: { text: string; createdAt: string }[];
   collapsed?: boolean;
@@ -121,6 +125,7 @@ type StudyPlan = {
   completedChapters?: Record<string, boolean>;
   colorIndex?: number;
 };
+const PLAN_SCHEDULE_VERSION = 2;
 type PlannedWeek = {
   week: number;
   focus: string;
@@ -365,6 +370,12 @@ const WEEKS: WeekPlan[] = WEEK_DETAILS.map((w, i) => ({
 function chaptersFor(bookId: string): Chapter[] {
   return CHAPTERS[bookId] || [{ n: 1, title: '完整阅读', page: 1 }];
 }
+function isReliableChapterList(chapters: Chapter[]) {
+  return chapters.length >= 4 && chapters.every((chapter, index) => chapter.n === index + 1 && Number.isFinite(chapter.page) && chapter.page >= 1);
+}
+function hasReliableChapterSequence(bookId: string) {
+  return isReliableChapterList(chaptersFor(bookId));
+}
 function isUsableChapter(title: string) {
   const clean = title.replace(/\s+/g, ' ').trim();
   return clean.length >= 3 && !/(印刷|出版|版次|版权|isbn|前言|目录|contents|copyright)/i.test(clean);
@@ -424,7 +435,7 @@ function dailyScheduleCoversBooks(days: PlannedDay[] | undefined, bookIds: strin
   const seen = new Set<string>();
   for (const day of days) for (const task of day.tasks) for (let chapter = task.start; chapter <= task.end; chapter += 1) {
     const key = `${task.bookId}:${chapter}`;
-    if (!expected.has(key)) return false;
+    if (!expected.has(key) || seen.has(key)) return false;
     seen.add(key);
   }
   return seen.size === expected.size;
@@ -471,12 +482,11 @@ function dailyRowsForSchedule(schedule: PlannedWeek[], startDate: string, weekda
   const weekdayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
   return schedule.flatMap((week, weekIndex) => {
     const rawReading = week.units.flatMap((unit) => unit.chapterNos.map((chapter) => ({ bookId: unit.bookId, chapter })));
-    // A daily plan must cover every available day. When a short chapter allocation
-    // has fewer than seven entries, divide those chapters into consecutive study blocks.
-    const segmentCount = rawReading.length ? Math.max(7, rawReading.length) : 0;
     const chapterOccurrences = new Map<string, number>();
-    const reading = Array.from({ length: segmentCount }, (_, index) => {
-      const source = rawReading[Math.min(rawReading.length - 1, Math.floor((index * rawReading.length) / segmentCount))];
+    // Never repeat a chapter simply to fill seven cards. A rest/review day is
+    // honest; a duplicated chapter makes coverage validation and completion
+    // tracking ambiguous.
+    const reading = rawReading.map((source) => {
       const key = `${source.bookId}:${source.chapter}`;
       chapterOccurrences.set(key, (chapterOccurrences.get(key) || 0) + 1);
       return { ...source, key };
@@ -924,18 +934,31 @@ export default function Home() {
     setStore((current) => {
       let changed = false;
       const studyPlans = current.studyPlans.map((plan) => {
+        const needsContentsRepair = plan.bookIds.some((bookId) => {
+          const book = current.uploadedBooks.find((item) => item.id === bookId);
+          return Boolean(book?.file.startsWith('local:')) && !hasReliableChapterSequence(bookId);
+        });
         const weeklyValid = scheduleCoversBooks(plan.schedule, plan.bookIds);
         const dailyValid = dailyScheduleCoversBooks(plan.dailySchedule, plan.bookIds);
-        if (weeklyValid && (!plan.dailySchedule || dailyValid)) return plan;
+        if (plan.scheduleVersion === PLAN_SCHEDULE_VERSION && weeklyValid && dailyValid && plan.scheduleNeedsContentsRepair === needsContentsRepair) return plan;
         changed = true;
+        // The deterministic allocation is the only source of chapter IDs. AI
+        // can add guidance, but cannot retain or introduce a chapter number.
+        const schedule = weeklyValid
+          ? plan.schedule!
+          : buildSchedule(plan.bookIds, plan.weeks, plan.weekdayTime, plan.weekendTime);
+        const dailySchedule = needsContentsRepair
+          ? undefined
+          : dailyRowsForSchedule(schedule, plan.startDate, plan.weekdayTime, plan.weekendTime)
+            .map((day) => ({ ...day, outcome: fallbackDailyOutcome(day, [...BOOKS, ...current.uploadedBooks]) }));
         return {
           ...plan,
-          schedule: weeklyValid
-            ? plan.schedule
-            : buildSchedule(plan.bookIds, plan.weeks, plan.weekdayTime, plan.weekendTime),
-          dailySchedule: undefined,
-          dailyGuidance: [],
+          schedule,
+          dailySchedule,
+          dailyGuidance: dailySchedule?.map((day) => ({ week: day.week, day: day.day, outcome: day.outcome })) || [],
           aiPlanApplied: false,
+          scheduleVersion: PLAN_SCHEDULE_VERSION,
+          scheduleNeedsContentsRepair: needsContentsRepair,
         };
       });
       return changed ? { ...current, studyPlans } : current;
@@ -1288,9 +1311,9 @@ export default function Home() {
     return contexts;
   }
   async function extractPlanFromBrief() {
-    const incompleteBook = planBooks.map((id) => books.find((book) => book.id === id)).find((book) => book?.file.startsWith('local:') && chaptersFor(book.id).length < 4);
+    const incompleteBook = planBooks.map((id) => books.find((book) => book.id === id)).find((book) => book?.file.startsWith('local:') && !hasReliableChapterSequence(book.id));
     if (incompleteBook) {
-      setPlanError(language === 'zh' ? `「${incompleteBook.title}」目前只识别到 ${chaptersFor(incompleteBook.id).length} 个章节，无法生成可靠计划。请先在书架点击“重建目录”；若文字层不足，页面会提示你再做整书 OCR。` : `“${incompleteBook.title}” has only ${chaptersFor(incompleteBook.id).length} detected chapters, which is not enough for a reliable plan. Rebuild its contents from the shelf first; use full-book OCR only if its text layer is insufficient.`);
+      setPlanError(language === 'zh' ? `「${incompleteBook.title}」的目录不连续或未验证（例如跳号章节），不能生成可靠计划。请先在书架点击“重建目录”；若文字层不足，页面会提示你再做整书 OCR。` : `“${incompleteBook.title}” has an incomplete or unverified chapter directory, so a reliable plan cannot be generated. Rebuild its contents from the shelf first; use full-book OCR only if its text layer is insufficient.`);
       return;
     }
     setPlanGenerating(true);
@@ -1460,6 +1483,8 @@ export default function Home() {
       dailyGuidance,
       dailySchedule,
       aiPlanApplied,
+      scheduleVersion: PLAN_SCHEDULE_VERSION,
+      scheduleNeedsContentsRepair: false,
       adjustedWeeks: {},
       conversation: [
         ...(planPreview?.conversation || []),
@@ -1549,6 +1574,8 @@ export default function Home() {
         planWeekdayTime,
         planWeekendTime,
       ),
+      scheduleVersion: PLAN_SCHEDULE_VERSION,
+      scheduleNeedsContentsRepair: false,
       adjustedWeeks: {},
       conversation: [{ text: planBrief, createdAt: new Date().toISOString() }],
       colorIndex: editingPlanId
@@ -1803,11 +1830,11 @@ export default function Home() {
       }
       await worker.terminate();
       setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrRequired: false, ocrTextReady: true } : book) }));
-      if (found.size < 4) {
-        setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrReady: false, ocrTextReady: true } : book) }));
-        throw new Error('整书 OCR 已完成，但只识别到不足 4 个章节，不能据此生成可靠计划。建议换用带清晰目录页的 PDF。');
-      }
       const chapters = storedChapters(found);
+      if (!isReliableChapterList(chapters)) {
+        setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrReady: false, ocrTextReady: true } : book) }));
+        throw new Error('整书 OCR 已完成，但目录仍有跳号或不足 4 个章节，不能据此生成可靠计划。建议换用带清晰章节页的 PDF。');
+      }
       CHAPTERS[target.id] = chapters;
       setStore((s) => ({
         ...s,
@@ -1850,9 +1877,9 @@ export default function Home() {
         setOcrProgress({ current: pageNo, total: pdf.numPages, startedAt });
       }
       const chapters = storedChapters(found);
-      if (chapters.length < 4) {
+      if (!isReliableChapterList(chapters)) {
         setStore((s) => ({ ...s, uploadedBooks: s.uploadedBooks.map((book) => book.id === target.id ? { ...book, ocrRequired: true, ocrReady: false, textLayerReady: false } : book) }));
-        throw new Error('这本书的文字层无法提供可靠目录。请使用“整书 OCR”识别后再生成学习计划。');
+        throw new Error('这本书的文字层无法提供连续、可靠的目录。请使用“整书 OCR”识别后再生成学习计划。');
       }
       CHAPTERS[target.id] = chapters;
       setStore((s) => ({
@@ -2006,12 +2033,12 @@ export default function Home() {
     setLastSession(null);
     setView('reader');
   }
-  async function resolveChapterStartPage(target: Book, chapterNo: number) {
+  async function resolveChapterStartPage(target: Book, chapterNo: number): Promise<number | null> {
     const saved = chaptersFor(target.id).find((chapter) => chapter.n === chapterNo);
     if (!target.file.startsWith('local:')) return saved?.page || 1;
     try {
       const file = await loadLocalPdf(target.id);
-      if (!file) return saved?.page || 1;
+      if (!file) return null;
       const pdfjs = await import('pdfjs-dist');
       pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
       const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
@@ -2049,11 +2076,13 @@ export default function Home() {
         return pageNo;
       }
     } catch {
-      // Retain the saved mapping if the local file cannot be scanned right now.
+      // A local chapter must be verified against a body heading. Falling back to
+      // the detected contents row would open the table of contents as if it
+      // were the chapter itself.
     }
-    return saved?.page || 1;
+    return null;
   }
-  function openPlanReader(plan: StudyPlan) {
+  async function openPlanReader(plan: StudyPlan) {
     const scheduled =
       plan.schedule ||
       buildSchedule(
@@ -2069,10 +2098,17 @@ export default function Home() {
     const chapterNo = saved?.chapterNo || unit?.chapterNos[0] || 1;
     const target = books.find((item) => item.id === bookId) || books[0];
     if (!target) return;
-    const resume =
-      saved?.page ||
-      chaptersFor(bookId).find((chapter) => chapter.n === chapterNo)?.page ||
-      1;
+    if (!chaptersFor(bookId).some((chapter) => chapter.n === chapterNo)) {
+      setUploadError('计划中的章节不在当前书目中。请先重建目录，再重新生成计划预览。');
+      return;
+    }
+    const resume = target.file.startsWith('local:')
+      ? await resolveChapterStartPage(target, chapterNo)
+      : saved?.page || await resolveChapterStartPage(target, chapterNo);
+    if (!resume) {
+      setUploadError(`无法验证「${target.title}」Ch.${chapterNo} 的正文页。请先在书架重建目录，再重新生成计划预览。`);
+      return;
+    }
     setStore((s) => ({ ...s, activePlanId: plan.id }));
     chooseWeek(saved?.week || 1);
     setSelectedBookId(bookId);
@@ -2083,7 +2119,15 @@ export default function Home() {
     const target = books.find((item) => item.id === unit.bookId);
     if (!target) return;
     const chapterNo = unit.chapterNos[0] || 1;
+    if (!chaptersFor(target.id).some((chapter) => chapter.n === chapterNo)) {
+      setUploadError('这一天的章节不在当前书目中。请先重建目录，再重新生成计划预览。');
+      return;
+    }
     const start = await resolveChapterStartPage(target, chapterNo);
+    if (!start) {
+      setUploadError(`无法验证「${target.title}」Ch.${chapterNo} 的正文页。请先在书架重建目录，再重新生成计划预览。`);
+      return;
+    }
     setStore((s) => ({
       ...s,
       activePlanId: plan.id,
@@ -2698,7 +2742,7 @@ export default function Home() {
               />
               <div className="mt-5 flex flex-wrap gap-2">
                 <button onClick={() => openPlanner(activePlan)} className="rounded-xl bg-[var(--ink)] px-3 py-2 text-sm font-semibold text-white">{language === 'zh' ? '继续规划对话' : 'Refine with AI'}</button>
-                <button onClick={() => openPlanReader(activePlan)} className="rounded-xl border border-[var(--line)] px-3 py-2 text-sm font-semibold">{language === 'zh' ? '继续阅读' : 'Continue reading'}</button>
+                <button onClick={() => void openPlanReader(activePlan)} className="rounded-xl border border-[var(--line)] px-3 py-2 text-sm font-semibold">{language === 'zh' ? '继续阅读' : 'Continue reading'}</button>
                 <button onClick={() => {
                   if (!window.confirm(language === 'zh' ? `确认删除「${activePlan.name}」吗？此操作只删除学习计划；已保存的笔记、问答和知识卡会被保留。` : `Delete “${activePlan.name}”? This only deletes the plan; notes, Q&A, and knowledge cards stay.`)) return;
                   setStore((s) => { const remaining = s.studyPlans.filter((item) => item.id !== activePlan.id); return { ...s, studyPlans: remaining, activePlanId: remaining[0]?.id }; });
@@ -2923,19 +2967,19 @@ export default function Home() {
                         <span className="mt-1 block text-sm text-[var(--muted)]">
                           {language === 'zh' ? `当前第 ${store.progress[b.id] || 1} 页 · 共 ${b.pages} 页` : `Page ${store.progress[b.id] || 1} of ${b.pages}`}
                         </span>
-                        {b.file.startsWith('local:') && chaptersFor(b.id).length < 4 && !b.ocrTextReady && (
+                        {b.file.startsWith('local:') && !hasReliableChapterSequence(b.id) && !b.ocrTextReady && (
                           <span className="mt-1 block text-xs font-medium text-[var(--brown)]">
-                            {language === 'zh' ? `目录待补全：目前仅识别 ${chaptersFor(b.id).length} 个章节。请先重建目录；若文字层不足，再进行整书 OCR。` : `Contents need review: only ${chaptersFor(b.id).length} chapters were detected. Rebuild the contents first; use full-book OCR only if the text layer is insufficient.`}
+                            {language === 'zh' ? `目录待修复：目前识别到 ${chaptersFor(b.id).length} 个章节，但有跳号或未验证页码。请先重建目录；若文字层不足，再进行整书 OCR。` : `Contents need review: ${chaptersFor(b.id).length} chapters were detected, but their sequence or pages are unverified. Rebuild the contents first; use full-book OCR only if its text layer is insufficient.`}
                           </span>
                         )}
-                        {b.file.startsWith('local:') && chaptersFor(b.id).length >= 4 && (
+                        {b.file.startsWith('local:') && hasReliableChapterSequence(b.id) && (
                           <span className="mt-1 block text-xs font-medium text-[var(--green)]">
                             {language === 'zh' ? `目录已识别 · ${chaptersFor(b.id).length} 个章节` : `Contents identified · ${chaptersFor(b.id).length} chapters`}
                           </span>
                         )}
                         {b.file.startsWith('local:') && b.ocrTextReady && !b.ocrReady && (
                           <span className="mt-1 block text-xs font-medium text-[var(--green)]">
-                            {language === 'zh' ? '整书 OCR 已完成，但目录仍不足 4 章，不能据此生成可靠计划。' : 'Full-book OCR is complete, but fewer than four chapters were identified; a reliable plan cannot be generated from it.'}
+                            {language === 'zh' ? '整书 OCR 已完成，但目录仍有跳号或不足 4 章，不能据此生成可靠计划。' : 'Full-book OCR is complete, but the contents still have gaps or fewer than four chapters; a reliable plan cannot be generated from it.'}
                           </span>
                         )}
                         <span className="mt-2 block h-1.5 overflow-hidden rounded-full bg-white">
@@ -2957,7 +3001,7 @@ export default function Home() {
                     >
                       {planBooks.includes(b.id) ? (language === 'zh' ? '已选入计划' : 'In this plan') : (language === 'zh' ? '加入计划' : 'Add to plan')}
                     </button>
-                    {b.file.startsWith('local:') && chaptersFor(b.id).length < 4 && !b.ocrTextReady && b.textLayerReady !== false && (
+                    {b.file.startsWith('local:') && !hasReliableChapterSequence(b.id) && !b.ocrTextReady && b.textLayerReady !== false && (
                       <button
                         onClick={() => rebuildBookContents(b)}
                         disabled={ocrIndexingBookId === b.id}
@@ -2966,7 +3010,7 @@ export default function Home() {
                         {ocrIndexingBookId === b.id ? (language === 'zh' ? `重建目录 ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `Contents ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '重建目录' : 'Rebuild contents')}
                       </button>
                     )}
-                    {b.file.startsWith('local:') && chaptersFor(b.id).length < 4 && !b.ocrTextReady && b.textLayerReady === false && (
+                    {b.file.startsWith('local:') && !hasReliableChapterSequence(b.id) && !b.ocrTextReady && b.textLayerReady === false && (
                       <button
                         onClick={() => ocrBookContents(b)}
                         disabled={ocrIndexingBookId === b.id}
@@ -2975,7 +3019,7 @@ export default function Home() {
                         {ocrIndexingBookId === b.id ? (language === 'zh' ? `整书 OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}` : `OCR ${ocrProgress?.current || 0}/${ocrProgress?.total || b.pages}`) : (language === 'zh' ? '一键 OCR 整本书' : 'OCR entire book')}
                       </button>
                     )}
-                    {b.file.startsWith('local:') && b.ocrTextReady && chaptersFor(b.id).length >= 4 && (
+                    {b.file.startsWith('local:') && b.ocrTextReady && hasReliableChapterSequence(b.id) && (
                       <span className="rounded-lg border border-[var(--green)] bg-white px-2.5 py-2 text-xs font-semibold text-[var(--green)]">
                         {language === 'zh' ? '已完成 OCR' : 'OCR complete'}
                       </span>
@@ -3775,7 +3819,7 @@ export default function Home() {
                           与 AI 修改
                         </button>
                         <button
-                          onClick={() => openPlanReader(plan)}
+                          onClick={() => void openPlanReader(plan)}
                           className="rounded-full bg-[var(--ink)] px-4 py-2 text-sm font-semibold text-white"
                         >
                           继续阅读
@@ -4140,6 +4184,9 @@ function WeekCard({
 }
 function DailyStudyCalendar({ plan, books, onOpenDay }: { plan: StudyPlan; books: Book[]; onOpenDay?: (day: PlannedDay) => void }) {
   const schedule = plan.schedule || [];
+  if (plan.scheduleNeedsContentsRepair) return <div className="mt-5 rounded-2xl border border-[#f0caca] bg-[#fff5f3] p-4 text-sm leading-6 text-[#a72b21]">
+    当前书目的章节目录存在跳号或未验证页码。为避免显示错误章节或跳回目录，本计划的每日安排已暂停；请先在书架点击“重建目录”，再重新生成计划预览。
+  </div>;
   const days = plan.dailySchedule?.length
     ? plan.dailySchedule
     : dailyRowsForSchedule(schedule, plan.startDate, plan.weekdayTime, plan.weekendTime);
