@@ -2938,7 +2938,7 @@ export default function Home() {
                 </label>
               </div>
               <p className="-mt-2 mb-4 text-xs text-[var(--muted)]">
-                {language === 'zh' ? `${books.length} 本 · 扫描件或低清晰度 PDF 上传后会标记为“需要整书 OCR”；完成后会保留在本机，阅读时无需逐页重复识别。建议 200–300 dpi。移除书籍不会删除你已保存的笔记、收藏或知识卡。` : `${books.length} books · Scanned or low-resolution PDFs are marked “Full-book OCR needed”. Once complete, results stay on this computer and are reused while reading. 200–300 dpi is recommended.`}
+                {language === 'zh' ? `${books.length} 本 · 扫描件或低清晰度 PDF 会标记为“需要整书 OCR”。若无法确认连续章节，仍可按页阅读，但计划不会安排可跳转的每日章节。建议上传 200–300 dpi、目录和章节标题清晰的 PDF。` : `${books.length} books · Scanned or low-resolution PDFs are marked “Full-book OCR needed”. If continuous chapters cannot be verified, you can still read by page, but plans cannot offer clickable daily chapter tasks. PDFs with a clear contents page and chapter headings at 200–300 dpi are recommended.`}
               </p>
               {hostedMode && (
                 <p className="-mt-1 mb-4 rounded-xl border border-[var(--line)] bg-[#f8faf8] px-3 py-2 text-xs leading-5 text-[var(--muted)]">
@@ -4344,6 +4344,7 @@ function PlannerModal({
         <div className="mt-6 grid gap-4 sm:grid-cols-2">
           {books.map((book) => {
             const active = selected.includes(book.id);
+            const directoryReady = !book.file.startsWith('local:') || hasReliableChapterSequence(book.id);
             return (
               <button
                 key={book.id}
@@ -4363,11 +4364,16 @@ function PlannerModal({
                   <span className="mt-3 block text-sm font-semibold text-[var(--brown)]">
                     {active ? '✓ 已加入计划' : '加入计划'}
                   </span>
+                  {!directoryReady && <span className="mt-2 block text-xs font-medium leading-5 text-[#b42318]">目录尚未可靠识别：可阅读，但计划无法保证每日任务跳到对应正文。请先在书架重新 OCR。</span>}
                 </span>
               </button>
             );
           })}
         </div>
+        {selected.some((bookId) => {
+          const book = books.find((item) => item.id === bookId);
+          return Boolean(book?.file.startsWith('local:')) && !hasReliableChapterSequence(bookId);
+        }) && <p role="alert" className="mt-4 rounded-xl bg-[#fff5f4] px-3 py-2 text-sm leading-6 text-[#b42318]">已选书中有低清晰度或跳号目录。你仍可按页阅读；要生成能跳转正文的每日计划，请先关闭此窗口，并在书架对该书点击“重新 OCR 整本书”。</p>}
         <section className="planner-chat mt-6 rounded-[28px] p-5">
           <div className="flex items-center justify-between">
             <div>
