@@ -4369,6 +4369,7 @@ function PlannerModal({
             {generating ? '正在生成 · 通常约 10–25 秒' : preview ? '重新生成计划预览' : '生成计划预览'}
           </button>
           {generating && <p className="mt-3 text-sm font-medium text-[var(--green)]">正在按你的日期、工作日/周末时长和两本书目录生成最终版本，请勿重复点击。</p>}
+          {!generating && error && <p role="alert" className="mt-3 rounded-xl bg-[#fff5f4] px-3 py-2 text-sm font-medium leading-6 text-[#b42318]">{error}</p>}
         </section>
         {preview && (
           <section className="mt-5 rounded-[28px] border border-[var(--line)] bg-white p-5">
@@ -4390,7 +4391,6 @@ function PlannerModal({
             ) : (
               <p className="mt-3 rounded-xl bg-[var(--gold-soft)] px-3 py-2 text-sm font-medium text-[var(--ink)]">当前为本地完整安排：时间与章节已生成，每日重点根据真实章节标题自动补全。</p>
             )}
-            {error && <p className="mt-3 rounded-xl bg-[#fff5f4] px-3 py-2 text-sm font-medium text-[#b42318]">{error}</p>}
             <p className="mt-4 text-sm leading-6 text-[var(--muted)]">章节范围按工作日与周末的可用时长分配；DeepSeek 仅生成并润色逐日学习重点，不会改动已校验的章节覆盖。</p>
             <DailyStudyCalendar plan={preview} books={books} />
             <button
