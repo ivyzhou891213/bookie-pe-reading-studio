@@ -28,8 +28,8 @@ Reading Coach（产品界面名为 **Bookie · PE Reading Studio / PE 阅读教�
 | OCR | Tesseract.js，浏览器本地运行 | 整书 OCR 和单页 OCR 的文字结果保存本机，不消耗 AI token。 |
 | 本地文件 | IndexedDB：数据库名 `bookie-private-library`，stores 为 `pdfs`、`ocrPages` | 已上传 PDF 与 OCR 页文本存在当前浏览器/设备；不是云端同步。 |
 | 用户记录 | `localStorage` 键 `pe-classroom-store` | 保存计划、问答、笔记、进度、知识卡、归档等；清理浏览器数据会丢失。 |
-| AI 设置与用量 | API Key 在 `localStorage`；日用 token 估算也在本地 | Key 不能写入源码、GitHub、部署变量或 HANDOFF。 |
-| AI 服务 | `/api/mentor`、`/api/knowledge`、`/api/planner`、`/api/formulas`、`/api/mock`、`/api/import` | 服务端把用户浏览器提交的 Key 直接转发给所选模型；当前默认 DeepSeek。 |
+| AI 设置与用量 | API Key 在 `sessionStorage`；日用 token 估算在本地 | Key 不写入源码、GitHub、部署变量或 HANDOFF；关闭浏览器后需要重新粘贴。 |
+| AI 服务 | `/api/mentor`、`/api/knowledge`、`/api/planner`、`/api/formulas`、`/api/mock`、`/api/import`、`/api/ai-test` | 服务端统一选择 DeepSeek 模型后再代理请求；当前默认 DeepSeek。 |
 | 部署 | Sites/Cloudflare 的公开测试站；`.openai/hosting.json` 含现有 project id 与 D1 逻辑绑定 | 当前尚未使用 D1；`db/schema.ts` 为空。 |
 
 ### 1.3 隐私、版权与上线边界
@@ -84,10 +84,10 @@ Reading Coach（产品界面名为 **Bookie · PE Reading Studio / PE 阅读教�
 | 工作 | 当前默认模型 | 行为约束 |
 | --- | --- | --- |
 | 阅读陪读、翻译、解释、阅读回顾、知识检索、公式整理、资料归档、学习计划 | DeepSeek Flash | 轻量、短输出、控制上下文与 token；翻译仅中文，其余常规问答中英双语。 |
-| 高难 PE / 投行技术模拟 | DeepSeek Pro | 仅面试模拟等高难推理使用；未配置 OpenAI 不影响其它功能。 |
+| 高难 PE / 投行技术模拟 | DeepSeek V4.1 Flash | DeepSeek 已宣布 V4 Pro 退役过渡；当前统一使用最新 Flash。 |
 | OpenAI | 未来可选 | 目前不是日常必需；不应在未填 Key 时自动调用。 |
 
-当前 `aiFor()` 的真实路由：`mock` 使用 `deepseek-v4-pro`，其他任务为 `deepseek-v4-flash`。设置页允许用户调整 Flash / Pro 的思考状态与推理档位；在 UI 中应保持可见、可解释，不能隐蔽地升级到贵模型。
+当前模型配置位于 `lib/ai-models.ts`：`flash → deepseek-flash`。DeepSeek 于 2026-09-10 发布 V4.1 Flash，旧 `deepseek-v4-flash` 只是暂时兼容转发；官方同时宣布 V4 Pro 将退役。因此 `AI_TASK_ROUTING` 的所有任务统一使用当前 Flash alias，包括技术模拟和投资分析。设置页应明确显示实际 API ID，不能继续把 Pro 伪装成稳定的长期选择。以后 DeepSeek 更新稳定 model ID，只改 `DEEPSEEK_MODELS`。
 
 ---
 
@@ -248,7 +248,7 @@ Reading Coach（产品界面名为 **Bookie · PE Reading Studio / PE 阅读教�
 | `app/api/knowledge/route.ts` | 知识库检索与当天阅读回顾。 |
 | `app/api/planner/route.ts` | AI 完整逐日排程 JSON；当前最大输出 5,000 tokens。 |
 | `app/api/formulas/route.ts` | 从 PDF 页段抽取公式并建立双语面试表达。 |
-| `app/api/mock/route.ts` | DeepSeek Pro 技术题生成与面试回答评估。 |
+| `app/api/mock/route.ts` | DeepSeek V4.1 Flash 技术题生成与面试回答评估。 |
 | `app/api/import/route.ts` | 面经 / 投资资料 AI 分析及自动分类。 |
 | `app/api/books/route.ts` | 服务器上传旧路径，见已知风险，不要在未审计前扩展。 |
 | `lib/formulas.ts` | 默认公式卡。 |

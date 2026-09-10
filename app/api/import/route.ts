@@ -1,9 +1,13 @@
+import { callDeepSeek, deepSeekErrorMessage } from '@/lib/deepseek-server';
+import type { DeepSeekModelTier } from '@/lib/ai-models';
+
 type ImportRequest = {
-  provider: 'deepseek' | 'openai';
-  model: string;
   apiKey: string;
+  defaultModel?: DeepSeekModelTier;
+  autoRoute?: boolean;
+  task?: 'import' | 'investment-analysis';
   thinking?: 'enabled' | 'disabled';
-  reasoningEffort?: 'low' | 'medium' | 'high';
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'max';
   kind: 'interview' | 'deal';
   title: string;
   url?: string;
@@ -58,18 +62,7 @@ export async function POST(request: Request) {
       ? 'archive.folder 必须是明确出现的公司名；若无法确认则为“未识别公司”。companies 只列资料明确提及的雇主/面试公司；industries 仅列资料明确出现的行业；topic 用简短中文概括面试主题。'
       : 'archive.folder 用最主要的行业或交易主题；companies 列出资料明确提及的 PE/投资方、被投企业或退出方；industries 使用简洁行业名；topic 用简短中文概括“投资 / 退出 / 募资 / 组合管理”等交易主题。';
     const prompt = `${instruction}\n\n同时自动归档，避免用户再手工分类。${archiveRule}\n只返回合法 JSON：{"analysis":"完整的结构化分析（可用 Markdown）","archive":{"folder":"...","companies":["..."],"industries":["..."],"topic":"...","tags":["..."]}}。不得凭空补写公司、行业、金额或交易事实。\n\n标题：${body.title}\n来源：${body.url || '用户粘贴正文'}\n\n正文：${source}`;
-    const endpoint =
-      body.provider === 'deepseek'
-        ? 'https://api.deepseek.com/chat/completions'
-        : 'https://api.openai.com/v1/chat/completions';
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${body.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: body.model,
+    const { response, data } = await callDeepSeek(body, {
         messages: [
           {
             role: 'system',
@@ -79,19 +72,11 @@ export async function POST(request: Request) {
           { role: 'user', content: prompt },
         ],
         response_format: { type: 'json_object' },
-        thinking: { type: body.thinking || 'disabled' },
-        reasoning_effort: body.reasoningEffort || 'low',
         max_tokens: 1400,
-        stream: false,
-      }),
     });
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-      error?: { message?: string };
-    };
     if (!response.ok)
       return Response.json(
-        { error: data.error?.message || '模型服务返回错误。' },
+        { error: deepSeekErrorMessage(response.status, data.error?.message) },
         { status: response.status },
       );
     const parsed = JSON.parse(data.choices?.[0]?.message?.content || '{}') as { analysis?: string; archive?: { folder?: string; companies?: unknown; industries?: unknown; topic?: string; tags?: unknown } };

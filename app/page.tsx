@@ -30,6 +30,7 @@ import {
   X,
 } from 'lucide-react';
 import { FORMULAS, type FormulaCard } from '@/lib/formulas';
+import { DEEPSEEK_MODELS, deepSeekDisplayName, deepSeekModelFor, type AiTask, type DeepSeekModelTier } from '@/lib/ai-models';
 
 type Book = {
   id: string;
@@ -791,13 +792,12 @@ export default function Home() {
   const [sessionStartPage, setSessionStartPage] = useState(53);
   const sessionPages = useRef<Set<number>>(new Set());
   const [lastSession, setLastSession] = useState<ReadingSession | null>(null);
-  const [provider, setProvider] = useState('deepseek');
-  const [model, setModel] = useState('deepseek-v4-flash');
+  const [defaultModel, setDefaultModel] = useState<DeepSeekModelTier>('flash');
+  const [autoRoute, setAutoRoute] = useState(true);
   const [apiKey, setApiKey] = useState('');
   const [openAiKey, setOpenAiKey] = useState('');
   const [flashThinking, setFlashThinking] = useState<'enabled' | 'disabled'>('disabled');
   const [flashEffort, setFlashEffort] = useState<'low' | 'medium' | 'high'>('low');
-  const [proEffort, setProEffort] = useState<'low' | 'medium' | 'high'>('high');
   const [historyQuery, setHistoryQuery] = useState('');
   const [historyBook, setHistoryBook] = useState('all');
   const [mockOpen, setMockOpen] = useState(false);
@@ -810,6 +810,7 @@ export default function Home() {
   const [summaryPreview, setSummaryPreview] = useState('');
   const [tokenUsage, setTokenUsage] = useState<TokenUsage>({ date: today, input: 0, output: 0, requests: 0 });
   const [saved, setSaved] = useState(false);
+  const [connectionTest, setConnectionTest] = useState<{ status: 'idle' | 'testing' | 'success' | 'error'; model?: string; responseTimeMs?: number; error?: string }>({ status: 'idle' });
   const [searchQuery, setSearchQuery] = useState('');
   const [knowledgeAnswer, setKnowledgeAnswer] = useState('');
   const [searching, setSearching] = useState(false);
@@ -892,13 +893,16 @@ export default function Home() {
           : item,
       ),
     });
-    setProvider(localStorage.getItem('pe-provider') || 'deepseek');
-    setModel(localStorage.getItem('pe-model') || 'deepseek-v4-flash');
-    setApiKey(localStorage.getItem('pe-api-key') || '');
-    setOpenAiKey(localStorage.getItem('pe-openai-api-key') || '');
+    const legacyDeepSeekKey = localStorage.getItem('pe-api-key') || '';
+    const legacyOpenAiKey = localStorage.getItem('pe-openai-api-key') || '';
+    setDefaultModel('flash');
+    setAutoRoute(localStorage.getItem('pe-deepseek-auto-route') !== 'false');
+    setApiKey(sessionStorage.getItem('pe-api-key') || legacyDeepSeekKey);
+    setOpenAiKey(sessionStorage.getItem('pe-openai-api-key') || legacyOpenAiKey);
+    if (legacyDeepSeekKey) { sessionStorage.setItem('pe-api-key', legacyDeepSeekKey); localStorage.removeItem('pe-api-key'); }
+    if (legacyOpenAiKey) { sessionStorage.setItem('pe-openai-api-key', legacyOpenAiKey); localStorage.removeItem('pe-openai-api-key'); }
     setFlashThinking((localStorage.getItem('pe-flash-thinking') as 'enabled' | 'disabled') || 'disabled');
     setFlashEffort((localStorage.getItem('pe-flash-effort') as 'low' | 'medium' | 'high') || 'low');
-    setProEffort((localStorage.getItem('pe-pro-effort') as 'low' | 'medium' | 'high') || 'high');
     const storedUsage = JSON.parse(localStorage.getItem('pe-token-usage') || 'null') as TokenUsage | null;
     if (storedUsage?.date === today) setTokenUsage(storedUsage);
     setSelectedWeek(Number(localStorage.getItem('pe-selected-week') || 1));
@@ -1098,16 +1102,18 @@ export default function Home() {
       .filter((item) => !needle || [item.question, item.quote, item.answer].join(' ').toLowerCase().includes(needle))
       .slice().reverse();
   }, [store.questions, historyBook, historyQuery]);
-  // 路由是按任务而非按页面设置：低延迟陪读用 Flash，需要综合多份材料的任务用 Pro。
-  // OpenAI 仅为未来的高级模拟预留；未配置时绝不会影响日常使用。
-  function aiFor(task: 'mentor' | 'summary' | 'planner' | 'knowledge' | 'formulas' | 'import' | 'mock') {
-    const advanced = task === 'mock';
+  // DeepSeek V4.1 Flash is the provider's current recommended model for both
+  // routine and complex tasks. The task key remains so future model families
+  // can be routed centrally without changing feature code.
+  function aiFor(task: AiTask) {
+    const routing = deepSeekModelFor(task, defaultModel, autoRoute);
     return {
-      provider: 'deepseek',
-      model: advanced ? 'deepseek-v4-pro' : 'deepseek-v4-flash',
-      apiKey: localStorage.getItem('pe-api-key') || apiKey,
-      thinking: advanced ? 'enabled' : flashThinking,
-      reasoningEffort: advanced ? proEffort : flashEffort,
+      task,
+      defaultModel,
+      autoRoute,
+      apiKey,
+      thinking: flashThinking,
+      reasoningEffort: flashEffort,
     };
   }
   function recordUsage(usage: ApiUsage | undefined, input: string, output: string) {
@@ -1417,9 +1423,10 @@ export default function Home() {
     if (key) {
       try {
         const plannerPayload = {
-            provider: ai.provider,
-            model: ai.model,
             apiKey: key,
+            task: ai.task,
+            defaultModel: ai.defaultModel,
+            autoRoute: ai.autoRoute,
             thinking: ai.thinking,
             reasoningEffort: ai.reasoningEffort,
             brief: planBrief,
@@ -1730,7 +1737,7 @@ export default function Home() {
 
   async function saveImportedItem() {
     if (!importTitle.trim() && !importUrl.trim()) return;
-    const ai = aiFor('import');
+    const ai = aiFor(importKind === 'deal' ? 'investment-analysis' : 'import');
     const key = ai.apiKey;
     if (!key) {
       setView('settings');
@@ -1743,9 +1750,10 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          provider: ai.provider,
-          model: ai.model,
           apiKey: key,
+          task: ai.task,
+          defaultModel: ai.defaultModel,
+          autoRoute: ai.autoRoute,
           thinking: ai.thinking,
           reasoningEffort: ai.reasoningEffort,
           kind: importKind,
@@ -2008,7 +2016,7 @@ export default function Home() {
       const response = await fetch('/api/formulas', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: ai.provider, model: ai.model, apiKey: key, thinking: ai.thinking, reasoningEffort: ai.reasoningEffort, bookId: target.id, bookTitle: target.title, excerpts: excerpts.slice(0, 120) }),
+        body: JSON.stringify({ ...ai, apiKey: key, bookId: target.id, bookTitle: target.title, excerpts: excerpts.slice(0, 120) }),
       });
       const data = (await response.json()) as { formulas?: FormulaCard[]; error?: string };
       if (!response.ok) throw new Error(data.error || '公式索引生成失败');
@@ -2278,15 +2286,36 @@ export default function Home() {
     }
   }, [page, book.id, ready, view, readerPlanId, selectedWeek]);
   function saveSettings() {
-    localStorage.setItem('pe-provider', provider);
-    localStorage.setItem('pe-model', model);
-    localStorage.setItem('pe-api-key', apiKey.trim());
-    localStorage.setItem('pe-openai-api-key', openAiKey.trim());
+    localStorage.setItem('pe-deepseek-default-model', 'flash');
+    localStorage.setItem('pe-deepseek-auto-route', String(autoRoute));
+    if (apiKey.trim()) sessionStorage.setItem('pe-api-key', apiKey.trim()); else sessionStorage.removeItem('pe-api-key');
+    if (openAiKey.trim()) sessionStorage.setItem('pe-openai-api-key', openAiKey.trim()); else sessionStorage.removeItem('pe-openai-api-key');
+    localStorage.removeItem('pe-api-key');
+    localStorage.removeItem('pe-openai-api-key');
     localStorage.setItem('pe-flash-thinking', flashThinking);
     localStorage.setItem('pe-flash-effort', flashEffort);
-    localStorage.setItem('pe-pro-effort', proEffort);
+    localStorage.removeItem('pe-pro-effort');
     setSaved(true);
     setTimeout(() => setSaved(false), 1800);
+  }
+  async function testDeepSeekConnection() {
+    if (!apiKey.trim()) {
+      setConnectionTest({ status: 'error', error: '请先填写 DeepSeek API Key。' });
+      return;
+    }
+    setConnectionTest({ status: 'testing' });
+    try {
+      const response = await fetch('/api/ai-test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey: apiKey.trim(), defaultModel }),
+      });
+      const data = await response.json() as { model?: string; responseTimeMs?: number; error?: string };
+      if (!response.ok) throw new Error(data.error || '连接测试失败。');
+      setConnectionTest({ status: 'success', model: data.model, responseTimeMs: data.responseTimeMs });
+    } catch (error) {
+      setConnectionTest({ status: 'error', error: error instanceof Error ? error.message : '网络错误：无法连接到 DeepSeek。' });
+    }
   }
   async function runTechnicalMock(action: 'generate' | 'review') {
     const ai = aiFor('mock');
@@ -2337,9 +2366,10 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          provider: ai.provider,
-          model: ai.model,
           apiKey: key,
+          task: ai.task,
+          defaultModel: ai.defaultModel,
+          autoRoute: ai.autoRoute,
           thinking: ai.thinking,
           reasoningEffort: ai.reasoningEffort,
           book: book.title,
@@ -2462,9 +2492,10 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          provider: ai.provider,
-          model: ai.model,
           apiKey: key,
+          task: ai.task,
+          defaultModel: ai.defaultModel,
+          autoRoute: ai.autoRoute,
           thinking: ai.thinking,
           reasoningEffort: ai.reasoningEffort,
           mode: 'daily-summary',
@@ -2591,9 +2622,10 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          provider: ai.provider,
-          model: ai.model,
           apiKey: key,
+          task: ai.task,
+          defaultModel: ai.defaultModel,
+          autoRoute: ai.autoRoute,
           thinking: ai.thinking,
           reasoningEffort: ai.reasoningEffort,
           query,
@@ -3250,7 +3282,7 @@ export default function Home() {
                 <div>
                   <h2 className="font-semibold">{language === 'zh' ? 'PE 导师' : 'PE Mentor'}</h2>
                   <p className="text-xs text-[var(--muted)]">
-                    {provider === 'deepseek' ? 'DeepSeek' : 'OpenAI'} · {model}
+                    DeepSeek · {deepSeekDisplayName(deepSeekModelFor('mentor', defaultModel, autoRoute).tier)}
                   </p>
                 </div>
               </div>
@@ -3497,7 +3529,7 @@ export default function Home() {
           </div>
           {mockOpen && (
             <section className="mt-6 rounded-3xl border border-[var(--green)] bg-white p-6">
-              <div className="flex items-center justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-wider text-[var(--green)]">Technical mock · DeepSeek Pro</p><h2 className="mt-1 text-xl font-semibold">{language === 'zh' ? '先作答，再看反馈' : 'Answer before feedback'}</h2></div><button onClick={() => setMockOpen(false)} className="rounded-xl border border-[var(--line)] p-2"><X className="size-4" /></button></div>
+              <div className="flex items-center justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-wider text-[var(--green)]">Technical mock · DeepSeek V4.1 Flash</p><h2 className="mt-1 text-xl font-semibold">{language === 'zh' ? '先作答，再看反馈' : 'Answer before feedback'}</h2></div><button onClick={() => setMockOpen(false)} className="rounded-xl border border-[var(--line)] p-2"><X className="size-4" /></button></div>
               <div className="mt-5 rounded-2xl bg-[var(--soft)] p-4 whitespace-pre-wrap leading-7">{mockBusy && !mockQuestion ? (language === 'zh' ? '正在根据已归档面经出题…' : 'Preparing a question from your archive…') : mockQuestion}</div>
               <textarea value={mockAnswer} onChange={(e) => setMockAnswer(e.target.value)} placeholder={language === 'zh' ? '在这里写下你的完整回答；提交后会自动归档到读书笔记。' : 'Write your answer here. Feedback will be automatically archived.'} className="mt-4 min-h-36 w-full rounded-2xl border border-[var(--line)] p-4 outline-none focus:border-[var(--green)]" />
               <div className="mt-4 flex flex-wrap gap-3"><button disabled={mockBusy} onClick={() => runTechnicalMock('review')} className="rounded-xl bg-[var(--green)] px-4 py-2.5 font-semibold text-white disabled:opacity-50">{mockBusy ? (language === 'zh' ? '正在评价…' : 'Reviewing…') : (language === 'zh' ? '提交并获取评价' : 'Submit for feedback')}</button><button disabled={mockBusy} onClick={() => runTechnicalMock('generate')} className="rounded-xl border border-[var(--line)] px-4 py-2.5 font-medium">{language === 'zh' ? '换一道题' : 'New question'}</button></div>
@@ -3528,7 +3560,7 @@ export default function Home() {
       {view === 'settings' && (
         <PageShell
           title="AI 与数据设置"
-          subtitle="先粘贴一把 DeepSeek Key 即可开始。系统按任务自动选择 Flash 或 Pro；OpenAI 是未来高级模拟的可选项。"
+          subtitle="先粘贴一把 DeepSeek Key 即可开始。当前全站使用官方最新 DeepSeek V4.1 Flash；OpenAI 是未来高级模拟的可选项。"
         >
           <div className="max-w-2xl space-y-5">
             <section className="rounded-3xl border border-[var(--line)] bg-white p-6">
@@ -3541,9 +3573,23 @@ export default function Home() {
                 type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder="粘贴 sk-…；只保存在这台电脑的浏览器里"
+                placeholder="粘贴 sk-…；仅在本次浏览器会话中保留"
                 className="h-11 w-full rounded-xl border border-[var(--line)] px-3 outline-none"
               />
+              <div className="mt-3 flex flex-wrap items-center gap-3">
+                <button onClick={testDeepSeekConnection} disabled={connectionTest.status === 'testing'} className="rounded-xl border border-[var(--green)] px-4 py-2 text-sm font-semibold text-[var(--green)] disabled:opacity-50">
+                  {connectionTest.status === 'testing' ? '正在测试…' : '测试连接'}
+                </button>
+                {connectionTest.status === 'success' && <p className="text-sm font-medium text-[var(--green)]">✓ DeepSeek API 连接成功 · {connectionTest.model} · {(connectionTest.responseTimeMs || 0) / 1000}s</p>}
+                {connectionTest.status === 'error' && <p className="text-sm font-medium text-[#b44335]">{connectionTest.error}</p>}
+              </div>
+              <div className="mt-5 rounded-2xl bg-[var(--soft)] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3"><div><p className="font-semibold">当前模型</p><p className="mt-1 text-xs text-[var(--muted)]">使用 DeepSeek 官方最新稳定 alias；模型升级只需改中央配置。</p></div><span className="text-xs text-[var(--muted)]">推荐默认</span></div>
+                <div className="mt-3 rounded-xl border border-[var(--line)] bg-white p-3 font-medium">DeepSeek V4.1 Flash</div>
+                <p className="mt-2 text-xs text-[var(--muted)]">API Model: {DEEPSEEK_MODELS.flash}</p>
+                <div className="mt-4 grid gap-2 text-sm sm:grid-cols-2"><div className="rounded-xl bg-white p-3"><b>普通任务</b><br /><span className="text-[var(--muted)]">V4.1 Flash · 更快、更省</span></div><div className="rounded-xl bg-white p-3"><b>复杂分析</b><br /><span className="text-[var(--muted)]">同样使用 V4.1 Flash</span></div></div>
+                <p className="mt-3 text-xs leading-5 text-[var(--muted)]">DeepSeek 于 2026-09-10 发布 V4.1 Flash，并公告旧 V4 Flash 已退役；V4 Pro 也将进入退役过渡。为避免显示一个即将失效的选择，Reading Studio 不再把 Pro 作为独立长期档位。</p>
+              </div>
               <label className="mb-2 mt-4 block text-sm font-medium">OpenAI API Key（可选，暂时不需要）</label>
               <input
                 type="password"
@@ -3569,15 +3615,13 @@ export default function Home() {
             <section className="rounded-3xl border border-[var(--line)] bg-white p-6">
               <h2 className="font-semibold">系统会怎样使用你的 Key</h2>
               <div className="mt-4 space-y-3 text-sm leading-6">
-                <div className="rounded-2xl bg-[var(--soft)] p-4"><b>DeepSeek Flash · 日常默认</b><br />陪读问答、学习计划、当日阅读回顾、知识库检索、公式整理、面经与投资雷达归档。先以成本和速度优先。</div>
-                <div className="rounded-2xl bg-[var(--soft)] p-4"><b>DeepSeek Pro · 高难任务</b><br />只用于技术模拟的出题、追问与评分。它是当前网站的最高档路由；不需要 OpenAI Key。</div>
+                <div className="rounded-2xl bg-[var(--soft)] p-4"><b>DeepSeek V4.1 Flash · 全站默认</b><br />陪读问答、学习计划、阅读回顾、知识库、公式整理、技术模拟与投资资料分析均使用当前官方最新 Flash。它是现在更快、更省的选择。</div>
               </div>
               <div className="mt-5 grid gap-3 rounded-2xl border border-[var(--line)] p-4 text-sm md:grid-cols-2">
                 <div><label className="block font-semibold">Flash 思考模式</label><select value={flashThinking} onChange={(e) => setFlashThinking(e.target.value as 'enabled' | 'disabled')} className="mt-2 h-10 w-full rounded-xl border border-[var(--line)] bg-white px-3"><option value="disabled">关闭：最快、最省</option><option value="enabled">开启：更仔细</option></select></div>
                 <div><label className="block font-semibold">Flash 推理强度</label><select disabled={flashThinking === 'disabled'} value={flashEffort} onChange={(e) => setFlashEffort(e.target.value as 'low' | 'medium' | 'high')} className="mt-2 h-10 w-full rounded-xl border border-[var(--line)] bg-white px-3 disabled:opacity-40"><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></div>
-                <div className="md:col-span-2"><label className="block font-semibold">Pro 推理强度（仅技术模拟）</label><select value={proEffort} onChange={(e) => setProEffort(e.target.value as 'low' | 'medium' | 'high')} className="mt-2 h-10 w-full rounded-xl border border-[var(--line)] bg-white px-3"><option value="low">低：更快</option><option value="medium">中：平衡</option><option value="high">高：更深入</option></select></div>
               </div>
-              <p className="mt-4 text-xs leading-5 text-[var(--muted)]">本地版会把 Key 存在当前浏览器，不上传到我们的数据库。正式上线前会改为用户登录后的加密服务端配置。</p>
+              <p className="mt-4 text-xs leading-5 text-[var(--muted)]">Key 不会写进网站代码或 GitHub。当前本地优先版本只在本次浏览器会话中保留，并经本站后端代理请求 DeepSeek；关闭浏览器后需再次粘贴。浏览器端自带 Key 的正式商业版本需要登录后加密保存到服务端，不能仅靠前端彻底隐藏。</p>
             </section>
             <section className="rounded-3xl border border-[var(--line)] bg-white p-6">
               <div className="flex items-center justify-between gap-4"><div><h2 className="font-semibold">今日 AI 用量</h2><p className="mt-1 text-sm text-[var(--muted)]">本机估算，用于控制习惯；最终扣费以 DeepSeek 控制台账单为准。</p></div><button onClick={() => { const empty = { date: today, input: 0, output: 0, requests: 0 }; setTokenUsage(empty); localStorage.setItem('pe-token-usage', JSON.stringify(empty)); }} className="text-sm font-medium text-[var(--green)]">清零本地统计</button></div>

@@ -1,5 +1,8 @@
+import { callDeepSeek, deepSeekErrorMessage } from '@/lib/deepseek-server';
+import type { DeepSeekModelTier } from '@/lib/ai-models';
+
 type HistoryItem={question:string;quote:string;answer:string;bookId:string;page:number};
-type KnowledgeRequest={provider:'deepseek'|'openai';model:string;apiKey:string;thinking?:'enabled'|'disabled';reasoningEffort?:'low'|'medium'|'high';query:string;history:HistoryItem[];mode?:'search'|'daily-summary'};
+type KnowledgeRequest={apiKey:string;defaultModel?:DeepSeekModelTier;autoRoute?:boolean;task?:'knowledge'|'summary';thinking?:'enabled'|'disabled';reasoningEffort?:'low'|'medium'|'high'|'max';query:string;history:HistoryItem[];mode?:'search'|'daily-summary'};
 
 const SYSTEM=`你是大型私募股权基金的投资导师和面试教练。用户有基础设施和跨境投资经验。请把检索问题整理为可长期复用的双语知识卡，而不是泛泛聊天。必须区分教材理论、历史问答和你的分析；没有资料支持时不要虚构书中页码或案例事实。`;
 
@@ -27,10 +30,8 @@ export async function POST(request:Request){
 列出3个英文追问，并用一两句英文给出答题方向。
 
 如果主题是行业估值，必须比较适用的估值方法、适用条件、关键KPI、主要陷阱，并给出方法选择结论。`;
-    const endpoint=body.provider==='deepseek'?'https://api.deepseek.com/chat/completions':'https://api.openai.com/v1/chat/completions';
-    const response=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${body.apiKey}`},body:JSON.stringify({model:body.model,messages:[{role:'system',content:SYSTEM},{role:'user',content:prompt}],thinking:{type:body.thinking || 'disabled'},reasoning_effort:body.reasoningEffort || 'low',max_tokens:body.mode==='daily-summary'?420:700,stream:false})});
-    const data=await response.json() as {choices?:Array<{message?:{content?:string}}>;error?:{message?:string};usage?:unknown};
-    if(!response.ok)return Response.json({error:data.error?.message||'模型服务返回错误。'},{status:response.status});
-    return Response.json({answer:data.choices?.[0]?.message?.content||'没有找到内容。',usage:data.usage});
-  }catch(error){return Response.json({error:error instanceof Error?error.message:'无法处理检索。'},{status:500})}
+    const { response, data, model }=await callDeepSeek(body,{messages:[{role:'system',content:SYSTEM},{role:'user',content:prompt}],max_tokens:body.mode==='daily-summary'?420:700});
+    if(!response.ok)return Response.json({error:deepSeekErrorMessage(response.status,data.error?.message)},{status:response.status});
+    return Response.json({answer:data.choices?.[0]?.message?.content||'没有找到内容。',usage:data.usage,model});
+  }catch(error){return Response.json({error:error instanceof Error && error.message === 'MISSING_API_KEY' ? '缺少 API Key 或检索问题。' : '无法处理检索。'},{status:500})}
 }
